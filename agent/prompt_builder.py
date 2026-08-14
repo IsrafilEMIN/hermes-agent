@@ -1175,6 +1175,9 @@ def _probe_remote_backend(env_type: str) -> str | None:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
+    env = None
+    output = ""
+    docker_cleanup_ok = True
     try:
         config = _get_env_config()
         # Build the environment the same way tools/terminal_tool.py does for a
@@ -1215,21 +1218,35 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_forward_env": config.get("docker_forward_env", []),
                 "docker_env": config.get("docker_env", {}),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+                "docker_network": config.get("docker_network", True),
                 "docker_extra_args": config.get("docker_extra_args", []),
                 "docker_shm_size": config.get("docker_shm_size", "1g"),
                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
             }
+        if env_type == "docker":
+            container_config.update({
+                "container_persistent": False,
+                "docker_persist_across_processes": False,
+                "docker_volumes": [],
+                "docker_mount_cwd_to_workspace": False,
+                "docker_forward_env": [],
+                "docker_env": {},
+                "docker_run_as_host_user": False,
+                "docker_network": False,
+                "docker_extra_args": [],
+                "docker_orphan_reaper": False,
+            })
 
         env = _create_environment(
             env_type=env_type,
             image=image,
-            cwd=config.get("cwd", ""),
+            cwd="/workspace" if env_type == "docker" else config.get("cwd", ""),
             timeout=config.get("timeout", 180),
             ssh_config=ssh_config,
             container_config=container_config,
             task_id="prompt-backend-probe",
-            host_cwd=config.get("host_cwd"),
+            host_cwd=None if env_type == "docker" else config.get("host_cwd"),
         )
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.
@@ -1242,14 +1259,30 @@ def _probe_remote_backend(env_type: str) -> str | None:
         result = env.execute(probe_cmd, timeout=4)
         if result.get("returncode") != 0:
             logger.debug("Backend probe returned non-zero: %r", result)
-            _BACKEND_PROBE_CACHE[cache_key] = ""
-            return None
-        output = (result.get("output") or "").strip()
-        if not output:
-            _BACKEND_PROBE_CACHE[cache_key] = ""
-            return None
+        else:
+            output = (result.get("output") or "").strip()
     except Exception as e:
         logger.debug("Backend probe failed: %s", e)
+    finally:
+        if env_type == "docker" and env is not None:
+            try:
+                env.cleanup(force_remove=True)
+            except Exception as e:
+                docker_cleanup_ok = False
+                logger.warning("Docker backend probe cleanup failed: %s", e)
+            try:
+                cleanup_finished = env.wait_for_cleanup(timeout=30.0)
+            except Exception as e:
+                docker_cleanup_ok = False
+                logger.warning("Docker backend probe cleanup wait failed: %s", e)
+            else:
+                if not cleanup_finished:
+                    docker_cleanup_ok = False
+                    logger.warning("Docker backend probe cleanup worker did not finish within 30 seconds")
+
+    if not docker_cleanup_ok:
+        output = ""
+    if not output:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 

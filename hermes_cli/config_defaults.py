@@ -385,6 +385,9 @@ DEFAULT_CONFIG = {
         # Opt-in egress lockdown for Docker terminal sessions. When false,
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,
+        # Mount profile credential, skill, cache, and attachment data into Docker.
+        # Disable for strict project-only confinement.
+        "docker_mount_hermes_data": True,
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
         # /dev/shm size for the Docker sandbox. Docker's 64 MB default silently
         # breaks Chromium/Playwright and PyTorch DataLoader workers; tmpfs is

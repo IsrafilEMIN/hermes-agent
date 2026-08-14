@@ -45,6 +45,18 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
 
 
+class PersistentContainerLookupError(RuntimeError):
+    """Persistent-container identity could not be determined safely."""
+
+
+class DuplicatePersistentContainerError(PersistentContainerLookupError):
+    """More than one persistent container matches the expected identity."""
+
+
+class PersistentContainerStartError(RuntimeError):
+    """The sole matching exited container could not be started safely."""
+
+
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
     """Return a deduplicated list of valid environment variable names."""
     normalized: list[str] = []
@@ -849,6 +861,56 @@ def _ensure_docker_available() -> None:
             )
 
 
+def _docker_volume_container_destination(volume_spec: str) -> Optional[str]:
+    """Extract the unmodified destination from a Docker short volume spec.
+
+    ``docker_volumes`` accepts ``source:destination[:options]``.  The only
+    extra source-side colon handled here is a Windows drive prefix; Docker
+    remains responsible for validating nonempty option values.
+    """
+    if not isinstance(volume_spec, str):
+        return None
+
+    fields = volume_spec.split(":")
+    windows_source = (
+        len(fields) in (3, 4)
+        and len(fields[0]) == 1
+        and fields[0].isascii()
+        and fields[0].isalpha()
+        and fields[1].startswith(("/", "\\"))
+        and fields[2].startswith("/")
+    )
+    if windows_source:
+        source = f"{fields[0]}:{fields[1]}"
+        destination = fields[2]
+        options = fields[3] if len(fields) == 4 else None
+    elif len(fields) in (2, 3):
+        source, destination = fields[:2]
+        options = fields[2] if len(fields) == 3 else None
+        named_source = (
+            len(source) >= 2
+            and source[0].isascii()
+            and source[0].isalnum()
+            and all(
+                char.isascii() and (char.isalnum() or char in "_.-")
+                for char in source[1:]
+            )
+        )
+        if not (source.startswith("/") or source.startswith("\\\\") or named_source):
+            return None
+    else:
+        return None
+
+    if not source or not destination.startswith("/"):
+        return None
+    if options is not None and (
+        not options or any(not option for option in options.split(","))
+    ):
+        return None
+
+    return destination
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
@@ -961,7 +1023,7 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if ":" in vol:
                 volume_args.extend(["-v", vol])
-                if ":/workspace" in vol:
+                if _docker_volume_container_destination(vol) == "/workspace":
                     workspace_explicitly_mounted = True
             else:
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
@@ -1008,6 +1070,12 @@ class DockerEnvironment(BaseEnvironment):
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
 
+        # Automatic profile-data mounts are optional so strict Docker profiles can
+        # expose only persistent sandbox state and explicitly approved volumes.
+        mount_hermes_data = os.getenv(
+            "TERMINAL_DOCKER_MOUNT_HERMES_DATA", "true"
+        ).strip().lower() in {"true", "1", "yes"}
+
         # Mount credential files (OAuth tokens, etc.) declared by skills.
         # Read-only so the container can authenticate but not modify host creds.
         try:
@@ -1017,7 +1085,7 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            for mount_entry in (get_credential_file_mounts() if mount_hermes_data else []):
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -1046,7 +1114,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in (get_skills_directory_mount() if mount_hermes_data else []):
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1068,7 +1136,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in (get_cache_directory_mounts() if mount_hermes_data else []):
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1457,13 +1525,14 @@ class DockerEnvironment(BaseEnvironment):
                             check=True,
                             stdin=subprocess.DEVNULL,
                         )
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                        logger.warning(
-                            "Failed to start existing container %s (state=%s): "
-                            "%s — falling back to a fresh container.",
-                            container_id[:12], state, e,
-                        )
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                         self._container_id = None
+                        raise PersistentContainerStartError(
+                            "The sole matching persistent container "
+                            f"{container_id} is {state} but could not be started; "
+                            "refusing to create a replacement because that could "
+                            "produce a duplicate. Inspect Docker state manually."
+                        ) from e
                 if self._container_id:
                     logger.info(
                         "Reusing container %s (task=%s, profile=%s, prior state=%s)",
@@ -1679,8 +1748,13 @@ class DockerEnvironment(BaseEnvironment):
                     )
                     self._container_id = cid
                     logger.info("Recovery: restarted container %s", cid[:12])
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                    logger.warning("Recovery: failed to start container %s: %s", cid[:12], e)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+                    raise PersistentContainerStartError(
+                        "Recovery found the sole matching persistent container "
+                        f"{cid} in state {state}, but it could not be started; "
+                        "refusing to create a replacement because that could "
+                        "produce a duplicate. Inspect Docker state manually."
+                    ) from e
 
         # 2. No reusable container — create a fresh one.
         if not self._container_id:
@@ -1829,17 +1903,13 @@ class DockerEnvironment(BaseEnvironment):
         profile_label: str,
         egress_label: str,
     ) -> Optional[tuple[str, str]]:
-        """Look for an existing container labeled for this (task, profile).
+        """Resolve the sole persistent container for this identity.
 
-        Returns ``(container_id, state)`` on hit, ``None`` on miss / on any
-        failure (including ``docker ps`` itself failing). State is one of the
-        values Docker reports via ``{{.State}}`` — e.g. ``running``, ``exited``,
-        ``created``, ``paused``, ``restarting``, ``dead``. The caller decides
-        whether the state warrants ``docker start`` before reuse.
-
-        Restricted to the docker-stored label set this class creates; never
-        matches containers that happened to be named ``hermes-*`` but were
-        started by some other tool.
+        Zero matching candidates is a visible create/recreate event. Exactly
+        one running candidate is reused silently; exactly one exited candidate
+        is returned for the caller to start after a warning. Any other state,
+        lookup failure, malformed Docker output, or duplicate match fails
+        closed without selecting or modifying a container.
         """
         try:
             filters = [
@@ -1849,71 +1919,94 @@ class DockerEnvironment(BaseEnvironment):
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
-                fmt = "{{.ID}}\t{{.State}}"
+                fmt = "{{.ID}}\t{{.Names}}\t{{.State}}"
             else:
-                # When egress is off, we widen the probe to find any
-                # task+profile container (regardless of egress label), then
-                # post-filter in Python: reject containers whose
-                # hermes-egress label is present and not "off".  Without
-                # this, a container created with egress=on can be silently
-                # reused after the operator runs "hermes egress disable",
-                # preserving baked-in proxy env and CA mounts.
-                fmt = '{{.ID}}\t{{.State}}\t{{.Label "' + _EGRESS_LABEL_KEY + '"}}'
+                # Widen the probe, then reject egress-enabled containers so
+                # disabling egress cannot reuse baked-in proxy state.
+                fmt = (
+                    '{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label "'
+                    + _EGRESS_LABEL_KEY + '"}}'
+                )
             result = subprocess.run(
-                [
-                    self._docker_exe, "ps", "-a",
-                    *filters,
-                    "--format", fmt,
-                ],
+                [self._docker_exe, "ps", "-a", *filters, "--format", fmt],
                 capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
+                text=True, encoding="utf-8", errors="replace",
                 timeout=10,
                 check=False,
                 stdin=subprocess.DEVNULL,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
-            logger.debug("docker ps probe failed: %s — will start a fresh container", e)
-            return None
+            raise PersistentContainerLookupError(
+                "Could not determine persistent-container cardinality; "
+                "refusing to create or select a container."
+            ) from e
         if result.returncode != 0:
-            logger.debug(
-                "docker ps probe returned %d: %s — will start a fresh container",
-                result.returncode, result.stderr.strip(),
+            raise PersistentContainerLookupError(
+                "Docker persistent-container lookup failed "
+                f"(exit {result.returncode}): {result.stderr.strip() or 'no error text'}; "
+                "refusing to create or select a container."
             )
-            return None
-        lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
-        if not lines:
-            return None
-        # Multiple matches are unusual (one (task, profile) should produce one
-        # container) but can happen if a previous Hermes process crashed
-        # mid-cleanup. Prefer a running one if present; otherwise pick the
-        # first listed. Stale duplicates get reaped by the orphan-reaper in a
-        # follow-up commit; we don't try to be heroic about them here.
-        running = None
-        first = None
-        for ln in lines:
+
+        candidates: list[tuple[str, str, str]] = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t", 3)
+            expected = 4 if egress_label == "off" else 3
+            if len(parts) != expected:
+                raise PersistentContainerLookupError(
+                    "Docker returned malformed persistent-container lookup output; "
+                    "refusing to create or select a container."
+                )
+            cid, name, state = parts[0], parts[1], parts[2].lower()
+            if not cid or not state:
+                raise PersistentContainerLookupError(
+                    "Docker returned incomplete persistent-container identity data; "
+                    "refusing to create or select a container."
+                )
             if egress_label == "off":
-                # Format: ID\tState\tEgressLabel — parse all three fields
-                # and reject containers with a non-off egress label.
-                parts = ln.split("\t", 2)
-                if len(parts) < 3:
-                    continue
-                cid, state, egress_val = parts[0], parts[1].lower(), parts[2]
-                if egress_val not in ("", "<no value>", "off"):
+                egress_value = parts[3]
+                if egress_value not in ("", "<no value>", "off"):
                     logger.debug(
-                        "skipping container %s for egress=off reuse: "
-                        "label %s=%r", cid, _EGRESS_LABEL_KEY, egress_val,
+                        "skipping container %s for egress=off reuse: label %s=%r",
+                        cid, _EGRESS_LABEL_KEY, egress_value,
                     )
                     continue
-            else:
-                parts = ln.split("\t", 1)
-                if len(parts) != 2:
-                    continue
-                cid, state = parts[0], parts[1].lower()
-            if first is None:
-                first = (cid, state)
-            if state == "running" and running is None:
-                running = (cid, state)
-        return running or first
+            candidates.append((cid, name or cid, state))
+
+        if not candidates:
+            logger.warning(
+                "No persistent container exists for task=%s, profile=%s; "
+                "creating one with the existing persistent /root and "
+                "/workspace host directories.",
+                task_label, profile_label,
+            )
+            return None
+
+        if len(candidates) > 1:
+            detail = ", ".join(
+                f"{name} ({cid}, {state})" for cid, name, state in candidates
+            )
+            raise DuplicatePersistentContainerError(
+                f"{len(candidates)} persistent containers match task={task_label}, "
+                f"profile={profile_label}; refusing to select or modify any. "
+                f"Inspect and resolve manually: {detail}"
+            )
+
+        cid, name, state = candidates[0]
+        if state == "running":
+            return cid, state
+        if state == "exited":
+            logger.warning(
+                "Persistent container %s (%s) is exited; starting it with "
+                "persistent /root and /workspace state retained.",
+                name, cid,
+            )
+            return cid, state
+        raise PersistentContainerLookupError(
+            f"The sole matching persistent container {name} ({cid}) is in "
+            f"unexpected state {state!r}; refusing to start, select, or replace it."
+        )
 
     def cleanup(self, *, force_remove: bool = False):
         """Tear down the container according to persist mode and *force_remove*.
