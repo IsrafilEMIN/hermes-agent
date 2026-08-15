@@ -483,6 +483,7 @@ export function StatusRule({
   liveSessionCount,
   sessionTitle,
   showSessionTitle,
+  showContextLabel,
   sessionStartedAt,
   turnStartedAt,
   voiceLabel,
@@ -494,14 +495,20 @@ export function StatusRule({
   const segs = statusBarSegments(cols)
 
   // On narrow terminals the context read-out collapses to a bare token count
-  // (`12k tok`) and the visual fill bar is dropped entirely.
-  const ctxLabel = usage.context_max
-    ? segs.compactCtx
-      ? `${fmtK(usage.context_used ?? 0)} tok`
-      : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
-    : usage.total > 0
-      ? `${fmtK(usage.total)} tok`
-      : ''
+  // (`12k tok`) and the visual fill bar is dropped entirely. The numeric
+  // label is gated by display.show_context_label (absent ⇒ on): when false,
+  // only this label is hidden — the fill bar + percentage below still render
+  // at widths where the bar shows.
+  const ctxLabel =
+    showContextLabel === false
+      ? ''
+      : usage.context_max
+        ? segs.compactCtx
+          ? `${fmtK(usage.context_used ?? 0)} tok`
+          : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
+        : usage.total > 0
+          ? `${fmtK(usage.total)} tok`
+          : ''
 
   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
@@ -909,6 +916,11 @@ interface StatusRuleProps {
    *  place of the cwd label. Absent ⇒ true. Never affects the terminal
    *  tab/window title. */
   showSessionTitle?: boolean
+  /** display.show_context_label: show the numeric context read-out
+   *  (e.g. `50k/200k`) next to the model. Absent ⇒ true. When false only
+   *  the numeric label is hidden — the fill bar + percentage still render
+   *  at widths where the bar normally shows. */
+  showContextLabel?: boolean
   status: string
   statusColor: string
   t: Theme

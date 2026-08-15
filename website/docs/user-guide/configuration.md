@@ -1740,6 +1740,7 @@ display:
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)
   show_cost: false        # Show estimated $ cost in the CLI status bar
   show_session_title: true  # TUI status bar: show session title badge instead of the cwd label
+  show_context_label: true  # TUI status bar: show the numeric context read-out (e.g. 50k/200k); false hides only the label, keeping the fill bar + percentage
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
@@ -1763,6 +1764,17 @@ display:
 ```
 
 Set it to `false` to keep the ordinary cwd/workspace label (in standard label styling) on the status bar even when the session has a title. This setting affects **only the status bar** — the terminal tab/window title (which also shows the session name) is never affected.
+
+### Status-bar context read-out
+
+`display.show_context_label` (default `true`) controls the numeric context read-out on the TUI status bar — `50k/200k` on wide terminals, or a bare `50k tok` on narrow ones. When set to `false`, only the numeric label is hidden: the fill bar and its percentage still render at the widths where the bar normally shows.
+
+```yaml
+display:
+  show_context_label: false  # hide the numeric token read-out; keep the fill bar + percentage
+```
+
+Set it to `false` if the raw token counts feel like noise and you only want the visual fill bar with its percentage. On narrow terminals (below the bar breakpoint) the collapsed `50k tok` read-out is hidden as well, since no bar renders there to replace it.
 
 ### Per-turn summary and spinner token flow
 

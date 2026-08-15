@@ -92,6 +92,11 @@ export interface ConfigDisplayConfig {
    *  place of the cwd/workspace label. Default true (absent ⇒ on). Only
    *  affects the status bar, never the terminal tab/window title. */
   show_session_title?: boolean
+  /** TUI status bar: show the numeric context read-out (e.g. `12k/200k`,
+   *  or `12k tok` on narrow terminals) next to the model. Default true
+   *  (absent ⇒ on). When false only the numeric label is hidden — the fill
+   *  bar + percentage still render at widths where the bar normally shows. */
+  show_context_label?: boolean
   streaming?: boolean
   thinking_mode?: string
   /**

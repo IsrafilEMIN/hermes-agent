@@ -504,6 +504,7 @@ const StatusRulePane = memo(function StatusRulePane({
         sessionStartedAt={status.sessionStartedAt}
         sessionTitle={status.sessionTitle}
         showSessionTitle={ui.showSessionTitle}
+        showContextLabel={ui.showContextLabel}
         status={ui.status}
         statusColor={status.statusColor}
         t={ui.theme}

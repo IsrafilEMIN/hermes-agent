@@ -1240,6 +1240,12 @@ DEFAULT_CONFIG = {
         # (backward compatible). Only affects the status bar — never the
         # terminal tab/window title.
         "show_session_title": True,
+        # TUI status bar: show the numeric context read-out (e.g. `12k/200k`,
+        # or `12k tok` on narrow terminals) next to the model. When false only
+        # the numeric label is hidden — the fill bar + percentage still render
+        # at widths where the bar normally shows. Default true (backward
+        # compatible).
+        "show_context_label": True,
         # Focus view (/focus): display-only reduced-output mode. When true the
         # CLI/TUI pins tool_progress to "off" (reusing the existing suppression
         # path), reports a per-turn hidden-line count with a recovery hint, and

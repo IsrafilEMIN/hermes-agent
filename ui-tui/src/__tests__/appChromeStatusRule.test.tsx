@@ -160,6 +160,54 @@ describe('StatusRule session title', () => {
   })
 })
 
+describe('StatusRule context label toggle', () => {
+  it('shows the numeric context read-out and the fill bar by default (flag absent)', () => {
+    const element = StatusRule({ ...baseProps })
+
+    const rendered = textContent(element)
+
+    expect(rendered).toContain('50k/200k')
+    expect(rendered).toContain('25%')
+    expect(rendered).toContain('█')
+  })
+
+  it('hides only the numeric label when showContextLabel is off, keeping the bar + percentage', () => {
+    const element = StatusRule({ ...baseProps, showContextLabel: false })
+
+    const rendered = textContent(element)
+
+    expect(rendered).not.toContain('50k/200k')
+    expect(rendered).not.toContain('50k')
+    // The fill bar + percentage still render at widths where the bar normally shows.
+    expect(rendered).toContain('25%')
+    expect(rendered).toContain('█')
+    // The bar keeps its separator even though the label slot is gone.
+    expect(rendered).toContain('[█')
+  })
+
+  it('hides the collapsed bare-token read-out on narrow terminals too', () => {
+    const element = StatusRule({ ...baseProps, cols: 60, showContextLabel: false })
+
+    const rendered = textContent(element)
+
+    // Compact read-out (`50k tok`) is a numeric label too — hidden as well.
+    expect(rendered).not.toContain('50k tok')
+    expect(rendered).not.toContain('tok')
+    // The bar never renders below its breakpoint, so no percentage either.
+    expect(rendered).not.toContain('%')
+  })
+
+  it('hides a total-only token read-out when showContextLabel is off', () => {
+    const element = StatusRule({
+      ...baseProps,
+      showContextLabel: false,
+      usage: { total: 1234 }
+    })
+
+    expect(textContent(element)).not.toContain('tok')
+  })
+})
+
 describe('StatusRule background-subagent indicator', () => {
   it('renders ⛓ N on a wide terminal when subagents are running', () => {
     const element = StatusRule({
