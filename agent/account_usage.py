@@ -18,6 +18,7 @@ from hermes_cli.auth import (
     AuthError,
     _decode_jwt_claims,
     _read_codex_tokens,
+    is_source_suppressed,
     read_credential_pool,
     resolve_codex_runtime_credentials,
 )
@@ -1217,6 +1218,46 @@ def _fetch_opencode_go_env_usage_snapshot(*, fresh: bool) -> tuple[AccountUsageS
     return (replace(snapshot, active=True),)
 
 
+def _hydrate_opencode_go_env_rows(entries) -> None:
+    """Re-resolve borrowed ``env:`` rows from the live environment.
+
+    ``env:VAR`` rows (seeded from .env by the pool seeder) persist
+    metadata-only: the disk-boundary sanitizer strips the token and the raw
+    read here never hydrates it, so an otherwise healthy env-backed profile
+    would report "no usable key".  Re-resolve the var with the seeder's own
+    .env-preferred helper (``get_env_prefer_dotenv`` - pure read, memoized
+    on .env mtime, never writes), honoring user suppression so a deliberately
+    removed env source is not resurrected by the usage path.
+    """
+    try:
+        from agent.credential_pool import get_env_prefer_dotenv
+    except Exception:
+        return
+    for entry in entries:
+        source = str(getattr(entry, "source", "") or "").strip()
+        if not source.startswith("env:"):
+            continue
+        env_var = source.split(":", 1)[1].strip()
+        if not env_var:
+            continue
+        # Mirror _seed_from_env's suppression gate: an env source the user
+        # removed (hermes auth remove opencode-go <N>) must not come back
+        # via the usage path just because the var still exists somewhere.
+        try:
+            if is_source_suppressed("opencode-go", source):
+                continue
+        except Exception:
+            pass
+        try:
+            resolved = str(get_env_prefer_dotenv(env_var) or "").strip()
+        except Exception:
+            resolved = ""
+        if resolved:
+            # runtime_api_key is a property over access_token on the real
+            # class; writing the field hydrates the row in place.
+            entry.access_token = resolved
+
+
 def _fetch_opencode_go_pool_usage_snapshots(
     *,
     active_entry_id: Optional[str] = None,
@@ -1264,6 +1305,13 @@ def _fetch_opencode_go_pool_usage_snapshots(
         return _fetch_opencode_go_env_usage_snapshot(fresh=fresh)
 
     entries.sort(key=lambda entry: (int(entry.priority or 0), str(entry.id)))
+
+    # Borrowed env rows persist tokenless on disk and the raw read never
+    # hydrates them; re-resolve from the live environment before the fetch
+    # loop so env-backed profiles render real numbers instead of
+    # "no usable key".  Placement is before effective_active_id selection:
+    # active marking must see the hydrated token.
+    _hydrate_opencode_go_env_rows(entries)
 
     known_ids = {entry.id for entry in entries}
     effective_active_id = active_entry_id if active_entry_id in known_ids else None

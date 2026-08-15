@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
-PROJECT_ROOT = "/workspace/hermes-agent"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -519,6 +519,7 @@ class OpenCodeGoForbiddenSymbolTests(unittest.TestCase):
         account_usage._fetch_opencode_go_account_usage_with_credentials,
         account_usage._fetch_opencode_go_account_usage,
         account_usage._fetch_opencode_go_env_usage_snapshot,
+        account_usage._hydrate_opencode_go_env_rows,
         account_usage._fetch_opencode_go_pool_usage_snapshots,
     )
 
@@ -650,12 +651,22 @@ class OpenCodeGoSecretSafetyTests(unittest.TestCase):
 
 
 class OpenCodeGoFetchPoolEnvPathTests(unittest.TestCase):
-    """``fetch_pool_account_usage("opencode-go")`` env path: missing/cache/fresh/failure."""
+    """``fetch_pool_account_usage("opencode-go")`` env path: missing/cache/fresh/failure.
+
+    Hermetic by construction: the pool read is stubbed EMPTY so the env-only
+    fallback is exercised regardless of the host's real auth.json (a real
+    opencode-go pool row on the developer machine would otherwise route
+    these tests into the pool path — credential_id appears, singleton shape
+    breaks).
+    """
 
     def setUp(self):
         _FakeHTTPClient.instances.clear()
         _FakeHTTPClient.response_queue = []
         account_usage._clear_pool_account_usage_cache_for_tests()
+        pool_empty = mock.patch.object(account_usage, "read_credential_pool", return_value=[])
+        pool_empty.start()
+        self.addCleanup(pool_empty.stop)
 
     def test_no_env_credential_is_empty_pool(self):
         with mock.patch.dict(os.environ):
@@ -798,19 +809,38 @@ class OpenCodeGoFetchPoolEnvPathTests(unittest.TestCase):
 class _FakePooledCredential:
     """Mirror of the real ``PooledCredential`` surface the pool path touches.
 
-    The pool path only ever reads ``id``, ``priority``,
-    ``runtime_api_key``, and ``runtime_base_url`` after ``from_dict``, so the
-    fake can be a plain namespace — exactly like the Codex pool tests.
+    The pool path only ever reads ``id``, ``priority``, ``source``,
+    ``runtime_api_key``, and ``runtime_base_url`` after ``from_dict``, and
+    (since Fix A) writes ``access_token`` when hydrating borrowed ``env:``
+    rows from the live ``get_env_prefer_dotenv`` value.  The fake carries
+    ``access_token``/``source`` as writable attrs and exposes
+    ``runtime_api_key``/``runtime_base_url`` as properties — exactly like the
+    real dataclass — so hydration is exercised end-to-end.
     """
+
+    def __init__(self, *, id, priority, source, access_token, base_url):
+        self.id = id
+        self.priority = priority
+        self.source = source
+        self.access_token = access_token
+        self.base_url = base_url
+
+    @property
+    def runtime_api_key(self) -> str:
+        return str(self.access_token or "")
+
+    @property
+    def runtime_base_url(self) -> str:
+        return str(self.base_url or "")
 
     @classmethod
     def from_dict(cls, provider, row):
-        return SimpleNamespace(
-            provider=provider,
+        return cls(
             id=row["id"],
             priority=row["priority"],
-            runtime_api_key=row.get("access_token", ""),
-            runtime_base_url=row.get("base_url", ""),
+            source=row.get("source", ""),
+            access_token=row.get("access_token", ""),
+            base_url=row.get("base_url", ""),
         )
 
 
@@ -847,6 +877,10 @@ class OpenCodeGoPoolRowsTests(unittest.TestCase):
         ]
         self.fake_pool_module = types.ModuleType("agent.credential_pool")
         self.fake_pool_module.PooledCredential = _FakePooledCredential
+        # Fix A: the pool path may re-resolve borrowed env: rows from the
+        # live environment. Stub the seeder's helper as a pure os.environ
+        # read so hydration tests are deterministic.
+        self.fake_pool_module.get_env_prefer_dotenv = os.environ.get
 
     def _run(self, fetcher, *, active_entry_id=None, fresh=False, rows=None, clear_env=True):
         """Run the pool fetch with stubbed rows + transport.
@@ -949,6 +983,174 @@ class OpenCodeGoPoolRowsTests(unittest.TestCase):
         # The keyless row can still be marked active (it is the live agent's
         # row; the display just shows it as unavailable).
         self.assertTrue(snapshots[1].active)
+
+    def test_env_row_hydrates_token_from_live_env(self):
+        # Fix A: a borrowed env: row (source "env:OPENCODE_GO_API_KEY",
+        # persisted tokenless on disk) must be re-resolved from the live
+        # environment so env-backed profiles render real numbers instead of
+        # "No usable OpenCode Go API key is stored for this account."
+        self.rows = [
+            {
+                "id": "env-row",
+                "priority": 0,
+                "label": "OPENCODE_GO_API_KEY",
+                "source": "env:OPENCODE_GO_API_KEY",
+                "access_token": "",
+                "base_url": "",
+            }
+        ]
+        calls = []
+
+        def fetcher(token, base_url):
+            calls.append((token, base_url))
+            return self._snapshot(used=42.0)
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": _TOKEN}):
+            snapshots = self._run(fetcher, rows=self.rows, clear_env=False)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(snapshots[0].available)
+        self.assertIsNone(snapshots[0].unavailable_reason)
+        self.assertEqual(snapshots[0].windows[0].used_percent, 42.0)
+        # The token actually used is the live env value, not the empty row.
+        self.assertEqual(calls, [(_TOKEN, "")])
+        self.assertEqual(snapshots[0].account_label, "OpenCode Go 1")
+        self.assertTrue(snapshots[0].active)
+
+    def test_env_row_without_env_value_stays_unavailable(self):
+        # Same borrowed env: row, but OPENCODE_GO_API_KEY is NOT set:
+        # hydration yields nothing, the row is never fetched, and it renders
+        # as an unavailable account (never crashes, never leaks).
+        self.rows = [
+            {
+                "id": "env-row",
+                "priority": 0,
+                "label": "OPENCODE_GO_API_KEY",
+                "source": "env:OPENCODE_GO_API_KEY",
+                "access_token": "",
+                "base_url": "",
+            }
+        ]
+        calls = []
+
+        def fetcher(token, base_url):
+            calls.append((token, base_url))
+            return self._snapshot()
+
+        snapshots = self._run(fetcher, rows=self.rows)  # clear_env=True
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(calls, [])
+        self.assertFalse(snapshots[0].available)
+        self.assertEqual(
+            snapshots[0].unavailable_reason,
+            "No usable OpenCode Go API key is stored for this account.",
+        )
+
+    def test_env_row_with_empty_env_value_stays_unavailable(self):
+        # The var EXISTS but is empty — hydration must treat it like unset:
+        # no fetch, unavailable account, no crash.
+        self.rows = [
+            {
+                "id": "env-row",
+                "priority": 0,
+                "label": "OPENCODE_GO_API_KEY",
+                "source": "env:OPENCODE_GO_API_KEY",
+                "access_token": "",
+                "base_url": "",
+            }
+        ]
+        calls = []
+
+        def fetcher(token, base_url):
+            calls.append((token, base_url))
+            return self._snapshot()
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": ""}):
+            snapshots = self._run(fetcher, rows=self.rows, clear_env=False)
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(calls, [])
+        self.assertFalse(snapshots[0].available)
+
+    def test_mixed_manual_and_env_rows_hydrated_independently(self):
+        # One manual row (token on disk) + one borrowed env row (tokenless on
+        # disk): the manual row fetches with its stored token, the env row is
+        # hydrated from the live var, and both are isolated on failure.
+        self.rows = [
+            {
+                "id": "manual-row",
+                "priority": 0,
+                "label": "person@example.com",
+                "source": "manual",
+                "access_token": "synthetic-token-manual",
+                "base_url": "",
+            },
+            {
+                "id": "env-row",
+                "priority": 1,
+                "label": "OPENCODE_GO_API_KEY",
+                "source": "env:OPENCODE_GO_API_KEY",
+                "access_token": "",
+                "base_url": "",
+            },
+        ]
+        calls = []
+
+        def fetcher(token, base_url):
+            calls.append((token, base_url))
+            return self._snapshot(used=float(len(token)))
+
+        with mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": _TOKEN}):
+            snapshots = self._run(fetcher, rows=self.rows, clear_env=False)
+
+        self.assertEqual(len(snapshots), 2)
+        # Manual row keeps its stored token; env row used the live value.
+        self.assertEqual(
+            sorted(calls),
+            [(_TOKEN, ""), ("synthetic-token-manual", "")],
+        )
+        self.assertEqual(
+            [item.windows[0].used_percent for item in snapshots],
+            [len("synthetic-token-manual"), len(_TOKEN)],
+        )
+        self.assertEqual([item.account_label for item in snapshots], ["OpenCode Go 1", "OpenCode Go 2"])
+        # Active falls to the first row with a usable key (the manual row).
+        self.assertEqual([item.active for item in snapshots], [True, False])
+
+    def test_suppressed_env_row_is_not_hydrated(self):
+        # The user removed the env source (hermes auth remove opencode-go);
+        # the usage path must NOT resurrect it from the live env var.
+        self.rows = [
+            {
+                "id": "env-row",
+                "priority": 0,
+                "label": "OPENCODE_GO_API_KEY",
+                "source": "env:OPENCODE_GO_API_KEY",
+                "access_token": "",
+                "base_url": "",
+            }
+        ]
+        calls = []
+
+        def fetcher(token, base_url):
+            calls.append((token, base_url))
+            return self._snapshot()
+
+        with (
+            mock.patch.object(
+                account_usage, "is_source_suppressed", return_value=True
+            ) as suppressed_mock,
+            mock.patch.dict(os.environ, {"OPENCODE_GO_API_KEY": _TOKEN}),
+        ):
+            snapshots = self._run(fetcher, rows=self.rows, clear_env=False)
+
+        suppressed_mock.assert_called_once_with("opencode-go", "env:OPENCODE_GO_API_KEY")
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(calls, [])
+        self.assertFalse(snapshots[0].available)
+        self.assertEqual(
+            snapshots[0].unavailable_reason,
+            "No usable OpenCode Go API key is stored for this account.",
+        )
 
     def test_failure_isolation_and_cache_keyed_by_entry_id(self):
         calls = []
