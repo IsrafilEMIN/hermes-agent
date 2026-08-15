@@ -567,3 +567,172 @@ class OpenCodeGoUsagePayloadTests(unittest.TestCase):
             finally:
                 release_fetch.set()
                 _unregister_session("sid-go")
+
+
+# ── Explicit /usage aggregation (session.usage RPC) ─────────────────────────
+# The explicit /usage surface aggregates every configured account across the
+# supported providers (openai-codex + opencode-go) regardless of the session's
+# active provider — so the env-backed OpenCode Go account sits alongside the
+# Codex pool accounts — while the default provider-gated snapshot
+# (session.info / status bar / end-of-turn refresh) never aggregates.
+
+
+def _aggregate_codex_snapshot(*, label="OpenAI-Codex-1", active=False, used=13.0):
+    return account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=account_usage._utc_now(),
+        account_label=label,
+        active=active,
+        windows=(account_usage.AccountUsageWindow("Session", used_percent=used),),
+    )
+
+
+def _aggregate_go_snapshot(*, label="OpenCode-Go-1", active=True, used=41.0):
+    return account_usage.AccountUsageSnapshot(
+        provider="opencode-go",
+        source="usage_api",
+        fetched_at=account_usage._utc_now(),
+        account_label=label,
+        active=active,
+        windows=(
+            account_usage.AccountUsageWindow("Rolling 5h", used_percent=10.0),
+            account_usage.AccountUsageWindow(
+                "Weekly", used_percent=used, reset_at=account_usage._utc_now()
+            ),
+        ),
+    )
+
+
+def test_aggregate_snapshot_lists_go_beside_codex_for_codex_parent(monkeypatch):
+    agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="entry-b")
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {"calls": 1, "total": 10})
+    seen = {}
+
+    def fake_aggregate(*, providers=("openai-codex", "opencode-go"), fresh=False):
+        seen.update(providers=providers, fresh=fresh)
+        return (_aggregate_codex_snapshot(), _aggregate_go_snapshot())
+
+    monkeypatch.setattr(account_usage, "fetch_aggregate_account_usage", fake_aggregate)
+
+    result = server._session_usage_snapshot({"agent": agent}, aggregate=True)
+
+    # The aggregate composes both providers by default (order-preserving).
+    assert seen == {"providers": ("openai-codex", "opencode-go"), "fresh": False}
+    assert result["calls"] == 1
+    assert [item["provider"] for item in result["accounts"]] == [
+        "openai-codex",
+        "opencode-go",
+    ]
+    assert [item["label"] for item in result["accounts"]] == [
+        "OpenAI-Codex-1",
+        "OpenCode-Go-1",
+    ]
+    # The Go weekly window (with its reset) rides the same detailed shape.
+    assert result["accounts"][1]["windows"][1]["label"] == "Weekly"
+    assert result["accounts"][1]["windows"][1]["reset_human"]
+    # Safe serializer: no internal credential id ever reaches the payload.
+    assert "credential_id" not in repr(result["accounts"])
+
+
+def test_aggregate_snapshot_forwards_fresh_flag(monkeypatch):
+    agent = SimpleNamespace(provider="opencode-go")
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {"calls": 1, "total": 10})
+    seen = {}
+
+    def fake_aggregate(*, providers=("openai-codex", "opencode-go"), fresh=False):
+        seen.update(fresh=fresh)
+        return (_aggregate_go_snapshot(),)
+
+    monkeypatch.setattr(account_usage, "fetch_aggregate_account_usage", fake_aggregate)
+
+    result = server._session_usage_snapshot({"agent": agent}, fresh=True, aggregate=True)
+
+    assert seen == {"fresh": True}
+    assert [item["provider"] for item in result["accounts"]] == ["opencode-go"]
+
+
+def test_aggregate_failure_is_fail_open_and_never_touches_pool_path(monkeypatch):
+    agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="entry-a")
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {"calls": 2, "total": 20})
+    pool_calls = []
+    monkeypatch.setattr(
+        account_usage,
+        "fetch_pool_account_usage",
+        lambda *_args, **_kwargs: pool_calls.append(1) or (),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "fetch_aggregate_account_usage",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("synthetic aggregate «sk-…»")),
+    )
+
+    result = server._session_usage_snapshot({"agent": agent}, aggregate=True)
+
+    # Fail-open: base usage stands, no accounts key, and the provider-gated
+    # path was never consulted (the aggregate branch returns on its own).
+    assert result == {"calls": 2, "total": 20}
+    assert "accounts" not in result
+    assert pool_calls == []
+    assert "«sk-…»" not in repr(result)
+
+
+def test_default_snapshot_never_aggregates(monkeypatch):
+    """session.info / status-bar path stays provider-gated: no aggregate call."""
+    agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="entry-b")
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {"calls": 1, "total": 10})
+    aggregate_calls = []
+
+    def fake_aggregate(*, providers=("openai-codex", "opencode-go"), fresh=False):
+        aggregate_calls.append(1)
+        return (_aggregate_go_snapshot(),)
+
+    monkeypatch.setattr(account_usage, "fetch_aggregate_account_usage", fake_aggregate)
+    monkeypatch.setattr(
+        account_usage,
+        "fetch_pool_account_usage",
+        lambda provider, *, active_entry_id=None, fresh=False: (
+            (_aggregate_codex_snapshot(),) if provider == "openai-codex" else ()
+        ),
+    )
+
+    result = server._session_usage_snapshot({"agent": agent})
+
+    assert aggregate_calls == []
+    assert [item["provider"] for item in result["accounts"]] == ["openai-codex"]
+
+
+def test_session_usage_rpc_aggregates_fresh_across_providers(monkeypatch):
+    """The explicit `session.usage` RPC (the /usage surface) calls the
+    aggregate snapshot with fresh=True: live numbers for every configured
+    account, regardless of the session's active provider."""
+    agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="entry-b")
+    session = _register_session(
+        "sid-aggregate", {"agent": agent, "session_key": "sess-aggregate", "cwd": ""}
+    )
+    seen = {}
+
+    def fake_aggregate(*, providers=("openai-codex", "opencode-go"), fresh=False):
+        seen.update(fresh=fresh)
+        return (_aggregate_codex_snapshot(), _aggregate_go_snapshot())
+
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {"calls": 1, "total": 10})
+    monkeypatch.setattr(account_usage, "fetch_aggregate_account_usage", fake_aggregate)
+    monkeypatch.setattr(account_usage, "nous_credits_lines", lambda **_: [])
+
+    try:
+        response = server._methods["session.usage"](
+            "rid-aggregate", {"session_id": "sid-aggregate"}
+        )
+
+        assert "error" not in response
+        result = response["result"]
+        assert seen == {"fresh": True}
+        assert result["calls"] == 1
+        assert [item["provider"] for item in result["accounts"]] == [
+            "openai-codex",
+            "opencode-go",
+        ]
+        assert "credential_id" not in repr(result["accounts"])
+    finally:
+        _unregister_session("sid-aggregate")

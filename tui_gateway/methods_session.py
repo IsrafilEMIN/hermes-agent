@@ -1362,7 +1362,13 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     agent = session.get("agent")
-    usage: dict = _session_usage_snapshot(session)
+    # Explicit /usage surface: aggregate every configured account across the
+    # supported providers (openai-codex + opencode-go), regardless of the
+    # session's active provider — so OpenCode Go sits alongside the Codex
+    # accounts. Fresh: an explicit limits request gets live numbers. The
+    # status-bar / session.info path keeps its provider-gated snapshot
+    # (``_session_usage_snapshot`` default) untouched.
+    usage: dict = _session_usage_snapshot(session, fresh=True, aggregate=True)
     if agent is None and not usage:
         usage = {"calls": 0, "input": 0, "output": 0, "total": 0}
     # Nous credits block — agent-independent (a portal fetch), so it shows even

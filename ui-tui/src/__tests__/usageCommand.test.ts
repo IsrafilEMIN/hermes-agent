@@ -228,7 +228,7 @@ describe('/usage slash command', () => {
 
     const goSections = panel.mock.calls.find(c => c[0] === 'OpenCode Go limits')?.[1] as { text?: string }[]
     const goBody = (goSections ?? []).map(s => s.text ?? '').join('\n')
-    expect(goBody).toContain('OpenCode Go')
+    expect(goBody).toContain('● OpenCode Go (active)')
     expect(goBody).toContain('  Rolling 5h: 90% remaining (10% used) · resets in 2h')
     expect(goBody).toContain('  Weekly: 59% remaining (41% used)')
     expect(goBody).toContain('  Monthly: 53% remaining (47% used)')

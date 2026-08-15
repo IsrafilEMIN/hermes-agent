@@ -151,7 +151,7 @@ describe('pool-aware Codex usage formatting', () => {
     expect(codexDetails.filter(line => line.includes('Legacy'))).toHaveLength(1)
 
     const goDetails = openCodeGoUsageDetails(mixed)
-    expect(goDetails.filter(line => line === 'OpenCode Go')).toHaveLength(1)
+    expect(goDetails.filter(line => line === '● OpenCode Go (active)')).toHaveLength(1)
     expect(goDetails.join('\n')).not.toContain('Codex 1')
   })
 
@@ -228,11 +228,17 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
   it('keeps the constant OpenCode Go details heading with remaining/used/reset lines', () => {
     const details = openCodeGoUsageDetails(goAccounts).join('\n')
 
-    expect(details.split('\n')[0]).toBe('OpenCode Go')
+    expect(details.split('\n')[0]).toBe('● OpenCode Go (active)')
     expect(details).toContain('OpenCode Go')
     expect(details).toContain('  Rolling 5h: 90% remaining (10% used) · resets in 2h')
     expect(details).toContain('  Weekly: 59% remaining (41% used)')
     expect(details).toContain('  Monthly: 53% remaining (47% used)')
+  })
+
+  it('drops to the ○ marker and no (active) suffix for an inactive Go account in details', () => {
+    const inactive: CodexUsageAccount[] = [{ ...goAccounts[0], active: false }]
+
+    expect(openCodeGoUsageDetails(inactive).join('\n').split('\n')[0]).toBe('○ OpenCode Go')
   })
 
   it('never surfaces the account label or credential identifiers in details', () => {
@@ -240,8 +246,9 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
 
     expect(details).not.toContain('opencode-go-key-9f3c')
     expect(details).not.toContain('9f3c')
-    // The heading is the constant safe label, never account.label or an index.
-    expect(details.split('\n')[0]).toBe('OpenCode Go')
+    // The heading is the persistent circle + constant safe label, never
+    // account.label or an index.
+    expect(details.split('\n')[0]).toBe('● OpenCode Go (active)')
   })
 
   it('clamps out-of-range percentages and reports unavailable windows in details', () => {

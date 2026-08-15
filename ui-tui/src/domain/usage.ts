@@ -92,6 +92,7 @@ export function formatOpenCodeGoUsage(accounts: CodexUsageAccount[] | undefined)
 export function openCodeGoUsageDetails(accounts: CodexUsageAccount[] | undefined): string[] {
   return (accounts ?? []).flatMap(account => {
     if (account.provider !== 'opencode-go') return []
+    const marker = accountMarker(account)
     const lines = (account.windows ?? []).map(window => {
       const left = remaining(window)
       const used =
@@ -101,6 +102,6 @@ export function openCodeGoUsageDetails(accounts: CodexUsageAccount[] | undefined
     })
     for (const detail of account.details ?? []) lines.push(`  ${detail}`)
     if (account.unavailable_reason) lines.push(`  Unavailable: ${account.unavailable_reason}`)
-    return ['OpenCode Go', ...lines]
+    return [`${marker} OpenCode Go${account.active ? ' (active)' : ''}`, ...lines]
   })
 }

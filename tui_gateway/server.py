@@ -5270,13 +5270,36 @@ def _current_profile_name() -> str:
 DESKTOP_BACKEND_CONTRACT = 6
 
 
-def _session_usage_snapshot(session: dict | None, *, fresh: bool = False) -> dict:
+def _session_usage_snapshot(
+    session: dict | None, *, fresh: bool = False, aggregate: bool = False
+) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
         return dict(mirror_usage)
     if agent is not None:
         usage = dict(_get_usage(agent))
+        if aggregate:
+            # Explicit /usage surface (`session.usage` RPC): every configured
+            # account across the supported providers (openai-codex +
+            # opencode-go) regardless of the session's active provider — so
+            # the env-backed OpenCode Go account sits alongside the Codex pool
+            # accounts. Fail-open exactly like the provider-gated path below:
+            # cosmetic quota telemetry must never break session.usage.
+            try:
+                from agent.account_usage import (
+                    account_usage_snapshot_to_dict,
+                    fetch_aggregate_account_usage,
+                )
+
+                usage["accounts"] = [
+                    account_usage_snapshot_to_dict(snapshot)
+                    for snapshot in fetch_aggregate_account_usage(fresh=fresh)
+                ]
+            except Exception:
+                # Cosmetic quota telemetry must never break session.usage.
+                logger.debug("aggregate account usage snapshot failed", exc_info=True)
+            return usage
         provider = str(getattr(agent, "provider", "") or "").strip().lower()
         # Account snapshots from the session's provider(s) concatenate into
         # one safe ``accounts`` list; each provider's fetch is independently
