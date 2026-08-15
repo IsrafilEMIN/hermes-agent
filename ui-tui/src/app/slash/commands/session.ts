@@ -655,11 +655,15 @@ export const sessionCommands: SlashCommand[] = [
         const sys = ctx.transcript.sys
 
         if (r) {
+          // The /usage panel renders from `r.accounts` below; deliberately do
+          // NOT mirror them into uiStore.usage — that store feeds the status
+          // bar, which must stay provider-gated (session.info payload only).
+          // Writing the aggregate (all providers) here would flood the bar
+          // with every pool account instead of the session's own provider.
           patchUiState(state => ({
             ...state,
             usage: {
               ...state.usage,
-              accounts: r.accounts,
               calls: r.calls ?? 0,
               input: r.input ?? 0,
               output: r.output ?? 0,

@@ -247,7 +247,65 @@ describe('/usage slash command', () => {
       cost_usd: 0.5,
       calls: 1
     })
-    expect(getUiState().usage.accounts?.filter(a => a.provider === 'opencode-go')).toHaveLength(1)
+    // The aggregate accounts are rendered into the /usage PANEL only; they
+    // must never be mirrored into uiStore.usage, because that store feeds the
+    // status bar (which is provider-gated via session.info).
+    expect(getUiState().usage.accounts).toBeUndefined()
+  })
+
+  it('does not flood the status-bar store with aggregate accounts', async () => {
+    // Pre-seed the store the way session.info would: provider-gated accounts
+    // for the CURRENT provider only (opencode-go parent, no Codex).
+    patchUiState(state => ({
+      ...state,
+      usage: {
+        ...state.usage,
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Go 1',
+            provider: 'opencode-go',
+            windows: [{ label: 'Weekly', used_percent: 41, reset_at: null, reset_human: null, detail: null }]
+          }
+        ]
+      }
+    }))
+
+    // The /usage RPC returns the AGGREGATE (Codex + Go) by design.
+    const { panel, run } = buildCtx({
+      'session.usage': baseUsage({
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Codex 1',
+            provider: 'openai-codex',
+            windows: []
+          },
+          {
+            active: true,
+            available: true,
+            label: 'Go 1',
+            provider: 'opencode-go',
+            windows: []
+          }
+        ]
+      })
+    })
+
+    await run('')
+
+    // Panel shows both providers (aggregate surface)...
+    const sections = panel.mock.calls.map(c => c[0])
+    expect(sections).toContain('Codex limits')
+    expect(sections).toContain('OpenCode Go limits')
+    // ...but the status-bar store keeps ONLY the pre-existing provider-gated
+    // accounts — no Codex account leaks into the bar.
+    const storeAccounts = getUiState().usage.accounts
+    expect(storeAccounts).toHaveLength(1)
+    expect(storeAccounts?.[0].provider).toBe('opencode-go')
+    expect(storeAccounts?.some(a => a.provider === 'openai-codex')).toBe(false)
   })
 
   it('shows only the OpenCode Go limits panel for a Go-only payload (no Codex panel)', async () => {
