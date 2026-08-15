@@ -338,6 +338,9 @@ export interface UiState {
   sections: SectionVisibility
   sessionTitle: string
   showReasoning: boolean
+  /** TUI status bar: show the session auto-title badge instead of the
+   *  cwd/workspace label. Default true; never affects the terminal title. */
+  showSessionTitle: boolean
   indicatorStyle: IndicatorStyle
   sid: null | string
   status: string

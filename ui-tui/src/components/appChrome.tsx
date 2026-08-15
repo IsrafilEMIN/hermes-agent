@@ -482,6 +482,7 @@ export function StatusRule({
   lastTurnEndedAt,
   liveSessionCount,
   sessionTitle,
+  showSessionTitle,
   sessionStartedAt,
   turnStartedAt,
   voiceLabel,
@@ -544,7 +545,11 @@ export function StatusRule({
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0) +
     (codexUsageText ? stringWidth(' │ ') + stringWidth(codexUsageText) : 0)
 
-  const rightLabel = sessionTitle ? ` ${sessionTitle} ` : cwdLabel
+  // The session-title badge replaces the cwd/workspace label on the right
+  // only while enabled (display.show_session_title). When disabled — or when
+  // no session title exists — the cwd label shows in ordinary label styling.
+  const showSessionTitleBadge = showSessionTitle !== false && !!sessionTitle
+  const rightLabel = showSessionTitleBadge ? ` ${sessionTitle} ` : cwdLabel
   const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
@@ -759,7 +764,11 @@ export function StatusRule({
         <>
           <Text color={t.color.border}>{separatorWidth >= 3 ? ' ─ ' : ' '}</Text>
           <Box flexShrink={0} width={rightWidth}>
-            <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+            <Text
+              bold={showSessionTitleBadge}
+              color={showSessionTitleBadge ? t.color.accent : t.color.label}
+              wrap="truncate-end"
+            >
               {rightLabel}
             </Text>
           </Box>
@@ -880,6 +889,10 @@ interface StatusRuleProps {
   notice?: Notice | null
   sessionStartedAt?: null | number
   sessionTitle?: string
+  /** display.show_session_title: show the session-title badge (accent) in
+   *  place of the cwd label. Absent ⇒ true. Never affects the terminal
+   *  tab/window title. */
+  showSessionTitle?: boolean
   status: string
   statusColor: string
   t: Theme

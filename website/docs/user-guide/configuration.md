@@ -1739,6 +1739,7 @@ display:
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)
   show_cost: false        # Show estimated $ cost in the CLI status bar
+  show_session_title: true  # TUI status bar: show session title badge instead of the cwd label
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
@@ -1751,6 +1752,17 @@ display:
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
   language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
+
+### Status-bar session title badge
+
+`display.show_session_title` (default `true`) controls the TUI status bar's far-right badge: when the current session has an auto-title, the badge replaces the cwd/workspace label and is rendered in the accent color.
+
+```yaml
+display:
+  show_session_title: false  # keep the cwd/workspace label even when a session title exists
+```
+
+Set it to `false` to keep the ordinary cwd/workspace label (in standard label styling) on the status bar even when the session has a title. This setting affects **only the status bar** — the terminal tab/window title (which also shows the session name) is never affected.
 
 ### Per-turn summary and spinner token flow
 

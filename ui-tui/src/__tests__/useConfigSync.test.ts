@@ -28,6 +28,7 @@ describe('applyDisplay', () => {
             details_mode: 'expanded',
             inline_diffs: false,
             show_reasoning: true,
+            show_session_title: false,
             streaming: false,
             tui_compact: true,
             tui_statusbar: false
@@ -43,6 +44,7 @@ describe('applyDisplay', () => {
     expect(s.detailsMode).toBe('expanded')
     expect(s.inlineDiffs).toBe(false)
     expect(s.showReasoning).toBe(true)
+    expect(s.showSessionTitle).toBe(false)
     expect(s.statusBar).toBe('off')
     expect(s.streaming).toBe(false)
   })
@@ -66,6 +68,7 @@ describe('applyDisplay', () => {
     expect(setBell).toHaveBeenCalledWith(false)
     expect(s.inlineDiffs).toBe(true)
     expect(s.showReasoning).toBe(false)
+    expect(s.showSessionTitle).toBe(true)
     expect(s.statusBar).toBe('top')
     expect(s.streaming).toBe(true)
     expect(s.sections).toEqual({})

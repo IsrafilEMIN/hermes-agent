@@ -1234,6 +1234,12 @@ DEFAULT_CONFIG = {
         # Show a color-coded battery read-out as the first status-bar element in
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,
+        # TUI status bar: show the session's auto-title as the far-right badge
+        # (accent-styled) in place of the cwd/workspace label. When false the
+        # cwd label is shown even if a session title exists. Default true
+        # (backward compatible). Only affects the status bar — never the
+        # terminal tab/window title.
+        "show_session_title": True,
         # Focus view (/focus): display-only reduced-output mode. When true the
         # CLI/TUI pins tool_progress to "off" (reusing the existing suppression
         # path), reports a per-turn hidden-line count with a recovery hint, and

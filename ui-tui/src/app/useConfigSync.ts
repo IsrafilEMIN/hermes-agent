@@ -283,6 +283,9 @@ export const applyDisplay = (
     pasteCollapseChars: _pasteCollapseCharsFromConfig(cfg),
     sections: resolveSections(d.sections),
     showReasoning: !!d.show_reasoning,
+    // Backward compatible: absent ⇒ on. Only gates the status-bar session
+    // title badge; the terminal tab/window title is untouched.
+    showSessionTitle: d.show_session_title !== false,
     statusBar: normalizeStatusBar(d.tui_statusbar),
     streaming: d.streaming !== false
   })

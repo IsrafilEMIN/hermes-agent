@@ -126,6 +126,38 @@ describe('StatusRule session title', () => {
     expect(title?.props.backgroundColor).toBeUndefined()
     expect(title?.props.color).toBe(DEFAULT_THEME.color.accent)
   })
+
+  it('shows the session-title badge by default when the flag is absent (backward compat)', () => {
+    const element = StatusRule({
+      ...baseProps,
+      sessionTitle: 'weekly-digest'
+    })
+
+    const rendered = textContent(element)
+    const title = findElementWithText(element, 'weekly-digest')
+
+    expect(rendered).toContain('weekly-digest')
+    expect(rendered).not.toContain('~/repo')
+    expect(title?.props.color).toBe(DEFAULT_THEME.color.accent)
+    expect(title?.props.bold).toBe(true)
+  })
+
+  it('keeps the cwd/workspace label in ordinary label styling when showSessionTitle is off', () => {
+    const element = StatusRule({
+      ...baseProps,
+      sessionTitle: 'weekly-digest',
+      showSessionTitle: false
+    })
+
+    const rendered = textContent(element)
+    const cwd = findElementWithText(element, '~/repo')
+
+    expect(rendered).toContain('~/repo')
+    expect(rendered).not.toContain('weekly-digest')
+    // Plain label styling — no accent badge treatment.
+    expect(cwd?.props.color).toBe(DEFAULT_THEME.color.label)
+    expect(cwd?.props.bold).not.toBe(true)
+  })
 })
 
 describe('StatusRule background-subagent indicator', () => {
@@ -333,7 +365,12 @@ describe('StatusRule session count click target', () => {
     })
 
     const rendered = textContent(element)
-    expect(rendered).toContain('● S87 W64 │ ○ S42 W91')
+    expect(rendered).toContain('● 87/64 ○ 42/91')
+    expect(rendered).not.toMatch(/S\d+ W\d+/)
+    // The Codex segment must not regress to the old wide form (S/W labels
+    // plus an inter-account separator). Scope the rejection to the Codex
+    // marker: the bar itself legitimately contains │ between model/context.
+    expect(rendered).not.toMatch(/●\s*S\d+ W\d+\s*│/)
     expect(rendered).not.toMatch(/C[12]/)
   })
 })

@@ -88,6 +88,10 @@ export interface ConfigDisplayConfig {
   sections?: Record<string, string>
   show_cost?: boolean
   show_reasoning?: boolean
+  /** TUI status bar: show the session auto-title as the far-right badge in
+   *  place of the cwd/workspace label. Default true (absent ⇒ on). Only
+   *  affects the status bar, never the terminal tab/window title. */
+  show_session_title?: boolean
   streaming?: boolean
   thinking_mode?: string
   /**
