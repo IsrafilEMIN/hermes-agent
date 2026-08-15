@@ -166,7 +166,7 @@ describe('/usage slash command', () => {
     const body = sections.map(section => section.text ?? '').join('\n')
     expect(body).toContain('● Codex 1 (active)')
     expect(body).toContain('Session: 87% remaining (13% used) · resets in 2h')
-    expect(body).toContain('? Codex 2')
+    expect(body).toContain('○ Codex 2')
     expect(body).toContain('stored OAuth credential was rejected')
     expect(panel.mock.calls.some(c => c[0] === 'Usage')).toBe(true)
     expect(getUiState().usage).toMatchObject({

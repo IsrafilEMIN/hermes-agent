@@ -33,17 +33,17 @@ const accounts: CodexUsageAccount[] = [
 
 describe('pool-aware Codex usage formatting', () => {
   it('renders wide, medium, and narrow layouts from remaining percentages', () => {
-    expect(formatCodexUsage(accounts, 120)).toBe('● 87/64 ○ 42/91')
-    expect(formatCodexUsage(accounts, 80)).toBe('● 87/64 ○ 42/91')
-    expect(formatCodexUsage(accounts, 60)).toBe('Codex min 42% · 2')
+    expect(formatCodexUsage(accounts, 120)).toBe('GPT ● 87/64 ○ 42/91')
+    expect(formatCodexUsage(accounts, 80)).toBe('GPT ● 87/64 ○ 42/91')
+    expect(formatCodexUsage(accounts, 60)).toBe('GPT ●○ min 42% · 2')
   })
 
   it('uses the medium circle-only form at every non-narrow width, dropping S/W labels and the wide separator', () => {
     const wide = formatCodexUsage(accounts, 120)
     const medium = formatCodexUsage(accounts, 80)
 
-    expect(wide).toBe('● 87/64 ○ 42/91')
-    expect(medium).toBe('● 87/64 ○ 42/91')
+    expect(wide).toBe('GPT ● 87/64 ○ 42/91')
+    expect(medium).toBe('GPT ● 87/64 ○ 42/91')
     expect(wide).not.toMatch(/S\d+ W\d+/)
     expect(medium).not.toMatch(/S\d+ W\d+/)
     expect(wide).not.toContain('│')
@@ -56,7 +56,7 @@ describe('pool-aware Codex usage formatting', () => {
     expect(details).toContain('○ Codex 2')
   })
 
-  it('marks exhausted and unavailable accounts without hiding peers', () => {
+  it('persists active/inactive circles for exhausted and unavailable accounts without hiding peers', () => {
     const mixed: CodexUsageAccount[] = [
       { ...accounts[0], windows: [{ label: 'Session', used_percent: 100 }] },
       {
@@ -68,10 +68,34 @@ describe('pool-aware Codex usage formatting', () => {
         windows: []
       }
     ]
-    expect(formatCodexUsage(mixed, 120)).toBe('! 0/? ? ?/?')
-    expect(formatCodexUsage(mixed, 80)).toBe('! 0/? ? ?/?')
-    expect(codexUsageDetails(mixed).join('\n')).toContain('? Codex 2')
+    // The circle is persistent: exhaustion shows up in the 0 slot, unavailability
+    // in the ? slots — never by swapping the marker out.
+    expect(formatCodexUsage(mixed, 120)).toBe('GPT ● 0/? ○ ?/?')
+    expect(formatCodexUsage(mixed, 80)).toBe('GPT ● 0/? ○ ?/?')
+    expect(formatCodexUsage(mixed, 60)).toBe('GPT ●○ min 0% · 2')
+    expect(codexUsageDetails(mixed).join('\n')).toContain('○ Codex 2')
     expect(codexUsageDetails(mixed).join('\n')).toContain('stored OAuth credential was rejected')
+  })
+
+  it('keeps the account circle for a single Codex account (active ● and inactive ○)', () => {
+    const single = [accounts[0]]
+    const inactiveSingle = [{ ...accounts[1] }]
+
+    expect(formatCodexUsage(single, 120)).toBe('GPT ● 87/64')
+    expect(formatCodexUsage(single, 80)).toBe('GPT ● 87/64')
+    expect(formatCodexUsage(single, 60)).toBe('GPT ● min 64% · 1')
+    expect(formatCodexUsage(inactiveSingle, 120)).toBe('GPT ○ 42/91')
+    expect(formatCodexUsage(inactiveSingle, 80)).toBe('GPT ○ 42/91')
+    expect(formatCodexUsage(inactiveSingle, 60)).toBe('GPT ○ min 42% · 1')
+  })
+
+  it('renders the GPT prefix with ? placeholders for missing windows', () => {
+    const partial: CodexUsageAccount[] = [
+      { ...accounts[0], windows: [{ label: 'Weekly', used_percent: 62 }] },
+      { ...accounts[1], windows: [{ label: 'Weekly', used_percent: 99 }] }
+    ]
+
+    expect(formatCodexUsage(partial, 120)).toBe('GPT ● ?/38 ○ ?/1')
   })
 
   it('clamps out-of-range percentages in detailed output', () => {
@@ -162,8 +186,8 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
     }
   ]
 
-  it('renders the full Go rolling/weekly/monthly remaining read-out', () => {
-    expect(formatOpenCodeGoUsage(goAccounts)).toBe('Go 90/59/53')
+  it('renders the full Go circle + rolling/weekly/monthly remaining read-out', () => {
+    expect(formatOpenCodeGoUsage(goAccounts)).toBe('Go ● 90/59/53')
   })
 
   it('renders ? for missing windows instead of dropping the segment', () => {
@@ -171,10 +195,16 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
       { ...goAccounts[0], windows: [{ label: 'Weekly', used_percent: 41 }] }
     ]
 
-    expect(formatOpenCodeGoUsage(partial)).toBe('Go ?/59/?')
+    expect(formatOpenCodeGoUsage(partial)).toBe('Go ● ?/59/?')
   })
 
-  it('renders Go ?/?/? for an unavailable account', () => {
+  it('keeps the persistent circle on the single env-backed account (○ when inactive)', () => {
+    const inactive: CodexUsageAccount[] = [{ ...goAccounts[0], active: false }]
+
+    expect(formatOpenCodeGoUsage(inactive)).toBe('Go ○ 90/59/53')
+  })
+
+  it('renders Go ● ?/?/? for an unavailable account', () => {
     const unavailable: CodexUsageAccount[] = [
       {
         active: true,
@@ -186,7 +216,7 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
       }
     ]
 
-    expect(formatOpenCodeGoUsage(unavailable)).toBe('Go ?/?/?')
+    expect(formatOpenCodeGoUsage(unavailable)).toBe('Go ● ?/?/?')
   })
 
   it('hides the segment entirely when no Go account is present', () => {
@@ -198,6 +228,7 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
   it('keeps the constant OpenCode Go details heading with remaining/used/reset lines', () => {
     const details = openCodeGoUsageDetails(goAccounts).join('\n')
 
+    expect(details.split('\n')[0]).toBe('OpenCode Go')
     expect(details).toContain('OpenCode Go')
     expect(details).toContain('  Rolling 5h: 90% remaining (10% used) · resets in 2h')
     expect(details).toContain('  Weekly: 59% remaining (41% used)')

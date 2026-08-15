@@ -330,7 +330,7 @@ describe('StatusRule session count click target', () => {
       }
     })
 
-    expect(textContent(element)).toContain('Codex min 42% · 2')
+    expect(textContent(element)).toContain('GPT ●○ min 42% · 2')
   })
 
   it('shows active/inactive account markers without C1/C2 identifiers on wide terminals', () => {
@@ -365,13 +365,61 @@ describe('StatusRule session count click target', () => {
     })
 
     const rendered = textContent(element)
-    expect(rendered).toContain('● 87/64 ○ 42/91')
+    expect(rendered).toContain('GPT ● 87/64 ○ 42/91')
     expect(rendered).not.toMatch(/S\d+ W\d+/)
     // The Codex segment must not regress to the old wide form (S/W labels
     // plus an inter-account separator). Scope the rejection to the Codex
     // marker: the bar itself legitimately contains │ between model/context.
     expect(rendered).not.toMatch(/●\s*S\d+ W\d+\s*│/)
     expect(rendered).not.toMatch(/C[12]/)
+  })
+
+  it('keeps the GPT prefix and the persistent account circle with a single Codex account', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 120,
+      usage: {
+        ...baseProps.usage,
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Codex 1',
+            provider: 'openai-codex',
+            windows: [
+              { label: 'Session', used_percent: 13 },
+              { label: 'Weekly', used_percent: 36 }
+            ]
+          }
+        ]
+      }
+    })
+
+    expect(textContent(element)).toContain('GPT ● 87/64')
+  })
+
+  it('uses the empty circle for a single inactive Codex account', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 120,
+      usage: {
+        ...baseProps.usage,
+        accounts: [
+          {
+            active: false,
+            available: true,
+            label: 'Codex 1',
+            provider: 'openai-codex',
+            windows: [
+              { label: 'Session', used_percent: 58 },
+              { label: 'Weekly', used_percent: 9 }
+            ]
+          }
+        ]
+      }
+    })
+
+    expect(textContent(element)).toContain('GPT ○ 42/91')
   })
 })
 
@@ -649,8 +697,8 @@ describe('StatusRule OpenCode Go segment', () => {
       StatusRule({ ...baseProps, cols: 80, usage: { ...baseProps.usage, accounts: [...goAccounts] } })
     )
 
-    expect(wide).toContain('Go 90/59/53')
-    expect(medium).toContain('Go 90/59/53')
+    expect(wide).toContain('Go ● 90/59/53')
+    expect(medium).toContain('Go ● 90/59/53')
   })
 
   it('stays full-form on a narrow terminal where the Codex read-out collapses', () => {
@@ -658,10 +706,11 @@ describe('StatusRule OpenCode Go segment', () => {
       StatusRule({ ...baseProps, cols: 60, usage: { ...baseProps.usage, accounts: [...bothProviders] } })
     )
 
-    // Codex collapses to the min-percentage form below 72 cols …
-    expect(rendered).toContain('Codex min 42% · 2')
+    // Codex collapses to the min-percentage form below 72 cols, keeping its
+    // persistent account circles …
+    expect(rendered).toContain('GPT ●○ min 42% · 2')
     // … but Go is pinned in the essential slot: the full r/w/m form survives.
-    expect(rendered).toContain('Go 90/59/53')
+    expect(rendered).toContain('Go ● 90/59/53')
   })
 
   it('renders Codex then Go in fixed order regardless of payload order', () => {
@@ -672,8 +721,8 @@ describe('StatusRule OpenCode Go segment', () => {
     // Go sits in the payload BEFORE the Codex accounts, yet the bar still
     // emits the Codex segment first, then the Go segment, sharing one
     // separator — provider-fixed order.
-    expect(rendered).toContain('● 87/64 ○ 42/91 │ Go 90/59/53')
-    expect(rendered.indexOf('● 87/64')).toBeLessThan(rendered.indexOf('Go 90/59/53'))
+    expect(rendered).toContain('GPT ● 87/64 ○ 42/91 │ Go ● 90/59/53')
+    expect(rendered.indexOf('GPT ● 87/64')).toBeLessThan(rendered.indexOf('Go ● 90/59/53'))
   })
 
   it('shows no Go segment when the payload has no opencode-go account', () => {
@@ -698,8 +747,10 @@ describe('StatusRule OpenCode Go segment', () => {
       StatusRule({ ...baseProps, cols: 80, usage: { ...baseProps.usage, accounts: [...goAccounts] } })
     )
 
-    expect(rendered).toContain('Go 90/59/53')
-    expect(rendered).not.toContain('●')
+    // The Go segment carries its own persistent full circle …
+    expect(rendered).toContain('Go ● 90/59/53')
+    // … but no Codex branding or empty-circle account markers.
+    expect(rendered).not.toContain('GPT')
     expect(rendered).not.toContain('○')
     expect(rendered).not.toContain('Codex')
   })

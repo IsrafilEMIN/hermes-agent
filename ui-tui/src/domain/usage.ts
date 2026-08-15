@@ -11,14 +11,11 @@ const windowFor = (account: CodexUsageAccount, kind: 'session' | 'weekly') =>
     return kind === 'session' ? label.includes('session') : label.includes('week')
   })
 
-const accountMarker = (account: CodexUsageAccount) => {
-  if (!account.available) return '?'
-  const values = [remaining(windowFor(account, 'session')), remaining(windowFor(account, 'weekly'))].filter(
-    (value): value is number => value != null
-  )
-  if (values.some(value => value <= 0)) return '!'
-  return account.active ? '●' : '○'
-}
+// The circle is persistent: every account gets exactly one marker, active or
+// not, regardless of how many accounts exist. `●` = active (full), `○` =
+// inactive (empty). Exhaustion/unavailability is conveyed by the percentage
+// slots (`0`, `?`) and the details panel, never by swapping the marker out.
+const accountMarker = (account: CodexUsageAccount) => (account.active ? '●' : '○')
 
 export function formatCodexUsage(accounts: CodexUsageAccount[] | undefined, cols: number): string {
   const visible = (accounts ?? []).filter(account => account.provider === 'openai-codex' || !account.provider)
@@ -30,17 +27,20 @@ export function formatCodexUsage(accounts: CodexUsageAccount[] | undefined, cols
         (value): value is number => value != null
       )
     )
-    return `Codex ${values.length ? `min ${Math.min(...values)}%` : '?'} · ${visible.length}`
+    // Circles persist here too: exactly one compact marker per visible
+    // account (● active / ○ inactive), then min/count as before.
+    const markers = visible.map(accountMarker).join('')
+    return `GPT ${markers} min ${values.length ? `${Math.min(...values)}%` : '?'} · ${visible.length}`
   }
 
-  return visible
+  return `GPT ${visible
     .map(account => {
       const session = remaining(windowFor(account, 'session'))
       const weekly = remaining(windowFor(account, 'weekly'))
       const marker = accountMarker(account)
       return `${marker} ${session ?? '?'}/${weekly ?? '?'}`
     })
-    .join(' ')
+    .join(' ')}`
 }
 
 export function codexUsageDetails(accounts: CodexUsageAccount[] | undefined): string[] {
@@ -75,15 +75,17 @@ const openCodeGoWindow = (account: CodexUsageAccount | undefined, kind: 'rolling
 
 /**
  * Compact status segment for the env-backed OpenCode Go account:
- * `Go <rolling>/<weekly>/<monthly>` remaining percentages, `?` per missing
- * window. Never exposes account labels or credential-derived identifiers.
+ * `Go ● <rolling>/<weekly>/<monthly>` remaining percentages (one persistent
+ * active-state circle, `●` active / `○` inactive), `?` per missing window.
+ * Never exposes account labels or credential-derived identifiers.
  */
 export function formatOpenCodeGoUsage(accounts: CodexUsageAccount[] | undefined): string {
   const visible = (accounts ?? []).filter(account => account.provider === 'opencode-go')
   if (!visible.length) return ''
   const go = visible[0]
   const fmt = (value: number | null) => (value == null ? '?' : String(value))
-  return `Go ${fmt(remaining(openCodeGoWindow(go, 'rolling')))}/${fmt(remaining(openCodeGoWindow(go, 'weekly')))}/${fmt(remaining(openCodeGoWindow(go, 'monthly')))}`
+  const marker = accountMarker(go)
+  return `Go ${marker} ${fmt(remaining(openCodeGoWindow(go, 'rolling')))}/${fmt(remaining(openCodeGoWindow(go, 'weekly')))}/${fmt(remaining(openCodeGoWindow(go, 'monthly')))}`
 }
 
 /** Detailed /usage block: `OpenCode Go` heading + rolling/weekly/monthly lines. */
