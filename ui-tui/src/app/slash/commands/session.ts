@@ -1,6 +1,7 @@
 import { usageBarsText } from '../../../components/overlayPrimitives.js'
 import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
+import { codexUsageDetails } from '../../../domain/usage.js'
 import type {
   BackgroundStartResponse,
   ConfigGetValueResponse,
@@ -654,9 +655,22 @@ export const sessionCommands: SlashCommand[] = [
         const sys = ctx.transcript.sys
 
         if (r) {
-          patchUiState({
-            usage: { calls: r.calls ?? 0, input: r.input ?? 0, output: r.output ?? 0, total: r.total ?? 0 }
-          })
+          patchUiState(state => ({
+            ...state,
+            usage: {
+              ...state.usage,
+              accounts: r.accounts,
+              calls: r.calls ?? 0,
+              input: r.input ?? 0,
+              output: r.output ?? 0,
+              total: r.total ?? 0
+            }
+          }))
+        }
+
+        const accountLines = codexUsageDetails(r?.accounts)
+        if (accountLines.length) {
+          ctx.transcript.panel('Codex limits', [{ text: accountLines.join('\n') }])
         }
 
         // Nous balance block is agent-independent (a portal fetch), so it shows

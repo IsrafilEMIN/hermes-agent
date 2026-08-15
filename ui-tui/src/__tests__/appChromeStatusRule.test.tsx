@@ -265,6 +265,41 @@ describe('StatusRule session count click target', () => {
     // … while the low-value tail (session count) is dropped, not truncated.
     expect(rendered).not.toContain('3 sessions')
   })
+
+  it('keeps the collapsed Codex pool summary while the cwd yields on narrow terminals', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 60,
+      cwdLabel: '~/src/hermes-agent/a/very/long/project/path',
+      usage: {
+        ...baseProps.usage,
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Codex 1',
+            provider: 'openai-codex',
+            windows: [
+              { label: 'Session', used_percent: 13 },
+              { label: 'Weekly', used_percent: 36 }
+            ]
+          },
+          {
+            active: false,
+            available: true,
+            label: 'Codex 2',
+            provider: 'openai-codex',
+            windows: [
+              { label: 'Session', used_percent: 58 },
+              { label: 'Weekly', used_percent: 9 }
+            ]
+          }
+        ]
+      }
+    })
+
+    expect(textContent(element)).toContain('Codex min 42% · 2')
+  })
 })
 
 describe('StatusRule credits notice render priority', () => {

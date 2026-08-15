@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { sessionCommands } from '../app/slash/commands/session.js'
+import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type { SessionUsageResponse } from '../gatewayTypes.js'
 
 const usageCommand = sessionCommands.find(cmd => cmd.name === 'usage')!
@@ -55,6 +56,7 @@ const balancePanel = (panel: ReturnType<typeof vi.fn>) => {
 describe('/usage slash command', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetUiState()
   })
 
   it('always shows the CTA; "no API calls yet" only when there is no balance', async () => {
@@ -120,5 +122,60 @@ describe('/usage slash command', () => {
     const body = balancePanel(panel)
     expect(body).toContain('free models only')
     expect(body).toContain('/subscription')
+  })
+
+  it('renders both Codex pool accounts without suppressing token usage', async () => {
+    patchUiState(state => ({
+      ...state,
+      usage: {
+        ...state.usage,
+        active_subagents: 2,
+        compressions: 1,
+        context_max: 200_000,
+        context_percent: 25,
+        context_used: 50_000,
+        cost_usd: 0.5
+      }
+    }))
+    const { panel, run } = buildCtx({
+      'session.usage': baseUsage({
+        calls: 1,
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Codex 1',
+            provider: 'openai-codex',
+            windows: [{ label: 'Session', used_percent: 13, reset_human: 'in 2h' }]
+          },
+          {
+            active: false,
+            available: false,
+            label: 'Codex 2',
+            provider: 'openai-codex',
+            unavailable_reason: 'The stored OAuth credential was rejected.',
+            windows: []
+          }
+        ]
+      })
+    })
+
+    await run('')
+
+    const sections = panel.mock.calls.find(c => c[0] === 'Codex limits')?.[1] as { text?: string }[]
+    const body = sections.map(section => section.text ?? '').join('\n')
+    expect(body).toContain('● Codex 1 (active)')
+    expect(body).toContain('Session: 87% remaining (13% used) · resets in 2h')
+    expect(body).toContain('? Codex 2')
+    expect(body).toContain('stored OAuth credential was rejected')
+    expect(panel.mock.calls.some(c => c[0] === 'Usage')).toBe(true)
+    expect(getUiState().usage).toMatchObject({
+      active_subagents: 2,
+      compressions: 1,
+      context_max: 200_000,
+      context_percent: 25,
+      context_used: 50_000,
+      cost_usd: 0.5
+    })
   })
 })

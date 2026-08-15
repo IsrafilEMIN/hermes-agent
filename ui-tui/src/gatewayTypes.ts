@@ -260,6 +260,7 @@ export interface SessionUndoResponse {
 }
 
 export interface SessionUsageResponse {
+  accounts?: Usage['accounts']
   active_subagents?: number
   cache_read?: number
   cache_write?: number

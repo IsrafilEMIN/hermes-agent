@@ -183,6 +183,7 @@ export interface SessionInfo {
 }
 
 export interface Usage {
+  accounts?: CodexUsageAccount[]
   active_subagents?: number
   calls: number
   compressions?: number
@@ -196,6 +197,25 @@ export interface Usage {
   output: number
   reasoning?: number
   total: number
+}
+
+export interface CodexUsageWindow {
+  detail?: null | string
+  label?: null | string
+  reset_at?: null | string
+  reset_human?: null | string
+  used_percent?: null | number
+}
+
+export interface CodexUsageAccount {
+  active?: boolean
+  available?: boolean
+  details?: string[]
+  label?: null | string
+  plan?: null | string
+  provider?: null | string
+  unavailable_reason?: null | string
+  windows?: CodexUsageWindow[]
 }
 
 export interface SudoReq {
