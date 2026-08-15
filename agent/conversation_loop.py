@@ -162,6 +162,11 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
     "awaiting your next message."
 )
 
+_BACKGROUND_DELEGATION_DISPATCHED_RESPONSE = (
+    "Background delegation is running. Its result will return automatically "
+    "when complete."
+)
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -1665,6 +1670,12 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+
+    # A successful asynchronous delegate_task dispatch sets this marker during
+    # tool execution. It is scoped to one parent turn: sibling tools already
+    # emitted in the same assistant batch still run, but the parent must not
+    # take another model iteration and duplicate delegated work.
+    agent._background_delegation_dispatched = False
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -6875,6 +6886,11 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                if getattr(agent, "_background_delegation_dispatched", False):
+                    _turn_exit_reason = "background_delegation_dispatched"
+                    final_response = _BACKGROUND_DELEGATION_DISPATCHED_RESPONSE
                     break
 
                 # Reset per-turn retry counters after successful tool

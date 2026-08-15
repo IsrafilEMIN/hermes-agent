@@ -171,6 +171,55 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     assert result["final_response"] == "done"
 
 
+def test_background_delegation_ends_turn_after_sibling_tool_batch_and_resets():
+    agent = _make_agent()
+    sibling_calls = [
+        _mock_tool_call(arguments='{"query":"delegated"}', call_id="delegate-call"),
+        _mock_tool_call(arguments='{"query":"retained"}', call_id="retained-call"),
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=sibling_calls),
+        _mock_response(content="next turn complete", finish_reason="stop"),
+    ]
+
+    executed: list[str] = []
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        for tool_call in assistant_message.tool_calls:
+            executed.append(tool_call.id)
+            messages.append(
+                make_tool_result_message("web_search", "ok", tool_call.id)
+            )
+        agent._background_delegation_dispatched = True
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
+    ):
+        first = agent.run_conversation("delegate and keep one sibling task")
+
+    assert executed == ["delegate-call", "retained-call"]
+    assert agent.client.chat.completions.create.call_count == 1
+    assert first["final_response"] == (
+        "Background delegation is running. Its result will return automatically "
+        "when complete."
+    )
+
+    agent._execute_tool_calls = MagicMock()
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        second = agent.run_conversation("a later turn")
+
+    assert agent._background_delegation_dispatched is False
+    assert agent.client.chat.completions.create.call_count == 2
+    assert second["final_response"] == "next turn complete"
+
+
 def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_path):
     """A visible interim assistant row must survive an immediate process exit.
 

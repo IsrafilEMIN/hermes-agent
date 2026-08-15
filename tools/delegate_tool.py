@@ -4029,18 +4029,24 @@ def delegate_task(
         )
 
         if dispatch.get("status") == "dispatched":
+            # Background delegation is the only path where the parent model
+            # could otherwise take another reasoning iteration while its child
+            # is still running. The conversation loop consumes this turn-scoped
+            # marker after the complete sibling tool batch has executed.
+            if parent_agent is not None:
+                parent_agent._background_delegation_dispatched = True
             n = len(_goals)
             note = (
-                "Subagent is running in the background. You and the user can "
-                "keep working; its full result re-enters the conversation as a "
-                "new message when it finishes. Do not wait or poll — just "
-                "continue."
+                "Subagent is running in the background. Any sibling tool calls "
+                "already emitted in this assistant batch may finish, then the "
+                "parent turn ends. Its full result re-enters the conversation "
+                "as a new message when it finishes."
                 if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
+                f"{n} subagents are running in parallel in the background. Any "
+                f"sibling tool calls already emitted in this assistant batch "
+                f"may finish, then the parent turn ends. Their consolidated "
+                f"results re-enter the conversation as a single message once "
+                f"ALL of them finish."
             )
             payload = {
                 "status": "dispatched",

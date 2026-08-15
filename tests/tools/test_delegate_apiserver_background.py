@@ -121,13 +121,17 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
         async_delivery=False,
     )
 
+    parent = _fake_parent()
+    parent._background_delegation_dispatched = False
     out = dt.delegate_task(
         goal="bg on api_server", context="ctx",
-        background=True, parent_agent=_fake_parent(),
+        background=True, parent_agent=parent,
     )
     parsed = json.loads(out)
     assert parsed["status"] == "dispatched", parsed
     assert parsed["mode"] == "background"
+    assert parent._background_delegation_dispatched is True
+    assert "parent turn ends" in parsed["note"]
 
     evt = _drain_one()
     assert evt is not None
@@ -157,11 +161,14 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
         async_delivery=False,
     )
 
+    parent = _fake_parent()
+    parent._background_delegation_dispatched = False
     out = dt.delegate_task(
         goal="one-shot", context="ctx",
-        background=True, parent_agent=_fake_parent(),
+        background=True, parent_agent=parent,
     )
     parsed = json.loads(out)
     assert parsed.get("status") != "dispatched", parsed
     assert "SYNCHRONOUSLY" in parsed.get("note", "")
+    assert parent._background_delegation_dispatched is False
     assert process_registry.completion_queue.empty()
