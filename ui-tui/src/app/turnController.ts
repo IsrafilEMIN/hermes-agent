@@ -21,7 +21,7 @@ import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '
 
 import type { Notice } from './interfaces.js'
 import { resetFlowOverlays } from './overlayStore.js'
-import { pushSnapshot } from './spawnHistoryStore.js'
+import { getSpawnHistory, patchSpawnSnapshotSubagent, pushSnapshot } from './spawnHistoryStore.js'
 import { archiveDoneTodos, getTurnState, patchTurnState, resetTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
@@ -1015,17 +1015,22 @@ class TurnController {
     // for older gateways that omit the field — those produce a flat list.
     const id = p.subagent_id || `sa:${p.task_index}:${p.goal || 'subagent'}`
 
+    // Late events (subagent.complete/tool/progress/thinking arriving after
+    // message.complete has already archived the tree and idle() cleared live
+    // state) must NOT resurrect a finished subagent into turn.subagents —
+    // that would block the "finished" title on the /agents overlay.  When
+    // no live row exists and creation is forbidden, reconcile the archived
+    // snapshot instead, so the overlay's history doesn't show the row
+    // 'running' forever.
+    const existing = getTurnState().subagents.find(item => item.id === id)
+
+    if (!existing && !opts.createIfMissing) {
+      this.reconcileArchivedSubagent(id, p, patch)
+
+      return
+    }
+
     patchTurnState(state => {
-      const existing = state.subagents.find(item => item.id === id)
-
-      // Late events (subagent.complete/tool/progress arriving after message.complete
-      // has already fired idle()) would otherwise resurrect a finished
-      // subagent into turn.subagents and block the "finished" title on the
-      // /agents overlay.  When `createIfMissing` is false we drop silently.
-      if (!existing && !opts.createIfMissing) {
-        return state
-      }
-
       const base: SubagentProgress = existing ?? {
         depth: p.depth ?? 0,
         goal: p.goal,
@@ -1043,37 +1048,7 @@ class TurnController {
         toolsets: p.toolsets
       }
 
-      // Map snake_case payload keys onto camelCase state.  Only overwrite
-      // when the event actually carries the field; `??` preserves prior
-      // values across streaming events that emit partial payloads.
-      const outputTail = p.output_tail
-        ? p.output_tail.map(e => ({
-            isError: Boolean(e.is_error),
-            preview: String(e.preview ?? ''),
-            tool: String(e.tool ?? 'tool')
-          }))
-        : base.outputTail
-
-      const next: SubagentProgress = {
-        ...base,
-        apiCalls: p.api_calls ?? base.apiCalls,
-        costUsd: p.cost_usd ?? base.costUsd,
-        depth: p.depth ?? base.depth,
-        filesRead: p.files_read ?? base.filesRead,
-        filesWritten: p.files_written ?? base.filesWritten,
-        goal: p.goal || base.goal,
-        inputTokens: p.input_tokens ?? base.inputTokens,
-        iteration: p.iteration ?? base.iteration,
-        model: p.model ?? base.model,
-        outputTail,
-        outputTokens: p.output_tokens ?? base.outputTokens,
-        parentId: p.parent_id ?? base.parentId,
-        reasoningTokens: p.reasoning_tokens ?? base.reasoningTokens,
-        taskCount: p.task_count ?? base.taskCount,
-        toolCount: p.tool_count ?? base.toolCount,
-        toolsets: p.toolsets ?? base.toolsets,
-        ...patch(base)
-      }
+      const next = this.applySubagentPayload(base, p, patch)
 
       // Stable order: by spawn (depth, parent, index) rather than insert time.
       // Without it, grandchildren can shuffle relative to siblings when
@@ -1084,6 +1059,78 @@ class TurnController {
 
       return { ...state, subagents }
     })
+  }
+
+  // Map snake_case payload keys onto camelCase state.  Only overwrite when
+  // the event actually carries the field; `??` preserves prior values across
+  // streaming events that emit partial payloads.  Shared by the live path
+  // and the archived-snapshot reconcile so both apply identical semantics.
+  private applySubagentPayload(
+    base: SubagentProgress,
+    p: SubagentEventPayload,
+    patch: (current: SubagentProgress) => Partial<SubagentProgress>
+  ): SubagentProgress {
+    const outputTail = p.output_tail
+      ? p.output_tail.map(e => ({
+          isError: Boolean(e.is_error),
+          preview: String(e.preview ?? ''),
+          tool: String(e.tool ?? 'tool')
+        }))
+      : base.outputTail
+
+    return {
+      ...base,
+      apiCalls: p.api_calls ?? base.apiCalls,
+      costUsd: p.cost_usd ?? base.costUsd,
+      depth: p.depth ?? base.depth,
+      filesRead: p.files_read ?? base.filesRead,
+      filesWritten: p.files_written ?? base.filesWritten,
+      goal: p.goal || base.goal,
+      inputTokens: p.input_tokens ?? base.inputTokens,
+      iteration: p.iteration ?? base.iteration,
+      model: p.model ?? base.model,
+      outputTail,
+      outputTokens: p.output_tokens ?? base.outputTokens,
+      parentId: p.parent_id ?? base.parentId,
+      reasoningTokens: p.reasoning_tokens ?? base.reasoningTokens,
+      taskCount: p.task_count ?? base.taskCount,
+      toolCount: p.tool_count ?? base.toolCount,
+      toolsets: p.toolsets ?? base.toolsets,
+      ...patch(base)
+    }
+  }
+
+  // A late update-only subagent event with no live row: find the archived
+  // snapshot holding this id and apply the same payload mapping in place.
+  // Searches newest-first — background batches can finish out of order, so
+  // the target is not always history[0] — and prefers snapshots of the
+  // current session to avoid cross-session composite-id collisions.  Never
+  // creates state: unknown ids are dropped exactly like the old live path.
+  // Disk copies (spawn_tree.save) are append-only per finished_at, so the
+  // in-memory history — documented as the authoritative same-session
+  // source in spawnHistoryStore — is reconciled without inventing an
+  // overwrite RPC.
+  private reconcileArchivedSubagent(
+    id: string,
+    p: SubagentEventPayload,
+    patch: (current: SubagentProgress) => Partial<SubagentProgress>
+  ) {
+    const sid = getUiState().sid
+    const history = getSpawnHistory()
+    const scoped = history.filter(snap => snap.sessionId === sid)
+    const snap = (scoped.length ? scoped : history).find(s => s.subagents.some(a => a.id === id))
+
+    if (!snap) {
+      return
+    }
+
+    const archived = snap.subagents.find(a => a.id === id)!
+    const next = this.applySubagentPayload(archived, p, patch)
+
+    // Patch by snapshot object identity (not snap.id): duplicate ids from
+    // same-millisecond pushes must not misroute the update to a newer
+    // snapshot with the same id.
+    patchSpawnSnapshotSubagent(snap, id, next)
   }
 }
 

@@ -123,6 +123,37 @@ export const pushDiskSnapshot = (r: SpawnTreeLoadResponse, path: string) => {
   $spawnHistory.set(next)
 }
 
+/**
+ * Replace one subagent inside an archived snapshot.  Used by the late-event
+ * reconcile in turnController: a `subagent.complete` (or tool/progress/
+ * thinking) arriving after message.complete already archived the tree and
+ * idle() cleared live state updates the archived row IN PLACE, so the
+ * /agents history never shows a stale 'running' forever.  Returns true when
+ * the snapshot/subagent pair was found and updated.
+ */
+export const patchSpawnSnapshotSubagent = (snapshot: SpawnSnapshot, subagentId: string, next: SubagentProgress): boolean => {
+  const history = $spawnHistory.get()
+
+  // Match by object identity, never by id: pushSnapshot ids derive from
+  // Date.now(), so two snapshots pushed within the same millisecond share
+  // an id and findIndex-by-id would update the wrong (newer) snapshot.
+  const index = history.findIndex(s => s === snapshot)
+
+  if (index < 0 || !history[index]!.subagents.some(a => a.id === subagentId)) {
+    return false
+  }
+
+  const snap = history[index]!
+  const updated: SpawnSnapshot = {
+    ...snap,
+    subagents: snap.subagents.map(a => (a.id === subagentId ? next : a))
+  }
+
+  $spawnHistory.set([...history.slice(0, index), updated, ...history.slice(index + 1)])
+
+  return true
+}
+
 function normaliseSubagent(raw: unknown): SubagentProgress {
   const o = raw as Record<string, unknown>
   const s = (v: unknown) => (typeof v === 'string' ? v : undefined)
