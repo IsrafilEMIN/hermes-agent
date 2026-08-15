@@ -2088,4 +2088,88 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
   })
+
+  describe('session.info usage', () => {
+    it('clears stale provider accounts when the next session.info usage omits accounts', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      // First session.info: Codex reports its usage accounts (and counters).
+      onEvent({
+        payload: {
+          model: 'codex-1',
+          skills: {},
+          tools: {},
+          usage: {
+            accounts: [{ active: true, plan: 'pro', provider: 'codex' }],
+            calls: 10,
+            input: 1000,
+            output: 500,
+            total: 1500
+          }
+        },
+        type: 'session.info'
+      } as any)
+
+      expect(getUiState().usage?.accounts).toHaveLength(1)
+
+      // Second session.info from a provider whose usage payload omits
+      // accounts entirely: the stale Codex accounts must not survive the
+      // shallow merge, while the other usage keys keep accumulating.
+      onEvent({
+        payload: {
+          model: 'other-model',
+          skills: {},
+          tools: {},
+          usage: { calls: 12, input: 1200, output: 600, total: 1800 }
+        },
+        type: 'session.info'
+      } as any)
+
+      expect(getUiState().usage?.accounts).toEqual([])
+      expect(getUiState().usage?.calls).toBe(12)
+      expect(getUiState().usage?.total).toBe(1800)
+    })
+
+    it('replaces accounts when the next session.info usage carries its own accounts', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({
+        payload: {
+          model: 'codex-1',
+          skills: {},
+          tools: {},
+          usage: {
+            accounts: [{ active: true, plan: 'pro', provider: 'codex' }],
+            calls: 10,
+            input: 1000,
+            output: 500,
+            total: 1500
+          }
+        },
+        type: 'session.info'
+      } as any)
+
+      onEvent({
+        payload: {
+          model: 'codex-2',
+          skills: {},
+          tools: {},
+          usage: {
+            accounts: [{ active: true, plan: 'free', provider: 'other' }],
+            calls: 11,
+            input: 1100,
+            output: 550,
+            total: 1650
+          }
+        },
+        type: 'session.info'
+      } as any)
+
+      // Authoritative replace, not a merge: only the new provider's accounts
+      // are present.
+      expect(getUiState().usage?.accounts).toEqual([{ active: true, plan: 'free', provider: 'other' }])
+    })
+  })
 })

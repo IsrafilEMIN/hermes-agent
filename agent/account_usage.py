@@ -950,7 +950,7 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
-# ── OpenCode Go (env-backed, read-only) ──────────────────────────────────────
+# ── OpenCode Go (pool-aware, read-only) ─────────────────────────────────────
 
 _OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
 _OPENCODE_GO_WINDOW_SPECS = (
@@ -1163,14 +1163,21 @@ def _unavailable_pool_snapshot(reason: str, *, provider: str = "openai-codex") -
     )
 
 
-# Stable internal cache key for the single env-backed OpenCode Go account.
-# Provider-specific by construction (the cache tuple is (provider, key)) and
-# never serialized: the pool path below never copies it onto a snapshot.
+# Stable internal cache key for the env-fallback OpenCode Go account. Only
+# used when NO pool rows are visible (classic env-only setups); pool rows
+# cache under their own entry ids. Provider-specific by construction (the
+# cache tuple is (provider, key)) and never serialized: the pool path never
+# copies it onto a snapshot.
 _OPENCODE_GO_ENV_CACHE_KEY = "env"
 
 
 def _fetch_opencode_go_env_usage_snapshot(*, fresh: bool) -> tuple[AccountUsageSnapshot, ...]:
     """Fetch the ONE env-backed OpenCode Go account into a singleton snapshot.
+
+    This is the compatibility fallback used by ``fetch_pool_account_usage``
+    when NO ``opencode-go`` pool rows are visible (classic env-only setups):
+    classic setups keep working exactly as before, byte-identical payloads
+    included (no ``credential_id``/``account_label`` beyond the active flag).
 
     Read-only by design: credential resolution is a strict env read
     (``OPENCODE_GO_API_KEY`` / ``OPENCODE_GO_BASE_URL``) with no pool
@@ -1210,6 +1217,115 @@ def _fetch_opencode_go_env_usage_snapshot(*, fresh: bool) -> tuple[AccountUsageS
     return (replace(snapshot, active=True),)
 
 
+def _fetch_opencode_go_pool_usage_snapshots(
+    *,
+    active_entry_id: Optional[str] = None,
+    fresh: bool = False,
+) -> tuple[AccountUsageSnapshot, ...]:
+    """Fetch OpenCode Go usage for every visible pool row, read-only.
+
+    Enumerates the persisted ``opencode-go`` pool rows with the same raw
+    ``read_credential_pool`` read + ``PooledCredential.from_dict`` parse as
+    the Codex pool path — never ``load_pool``/``select``/``peek``, no token
+    refresh, no persistence, no routing mutation — then fetches each row's
+    usage through the existing explicit Go transport
+    (``_fetch_opencode_go_account_usage_with_credentials``) with that row's
+    own ``runtime_api_key``/``runtime_base_url``.
+
+    Per-row behavior mirrors the Codex entries exactly: the 60s cache is
+    keyed ``("opencode-go", entry.id)``, failures are isolated per row
+    (401/403 → "key rejected", anything else → temporary-unavailable, and a
+    row with no stored key → its own unavailable snapshot), and the
+    ``active`` flag follows ``active_entry_id`` when it names a visible row,
+    else the first row with a usable key (priority order), else the first
+    row.  Labels are safe ordinals (``OpenCode Go N``) — raw row labels,
+    ids, and tokens are never placed on display fields.
+
+    Compatibility fallback: when NO pool rows are visible (classic env-only
+    setup, or the pool read itself fails), delegates to
+    ``_fetch_opencode_go_env_usage_snapshot`` so env-only setups keep the
+    exact pre-pool behavior.
+    """
+    try:
+        from agent.credential_pool import PooledCredential
+
+        raw_rows = read_credential_pool("opencode-go")
+        entries = [
+            PooledCredential.from_dict("opencode-go", row)
+            for row in raw_rows
+            if isinstance(row, dict)
+        ]
+    except Exception:
+        entries = []
+
+    if not entries:
+        # Env-only compatibility fallback (classic setups, or a failed pool
+        # read): never let a pool-read hiccup hide a configured env account.
+        return _fetch_opencode_go_env_usage_snapshot(fresh=fresh)
+
+    entries.sort(key=lambda entry: (int(entry.priority or 0), str(entry.id)))
+
+    known_ids = {entry.id for entry in entries}
+    effective_active_id = active_entry_id if active_entry_id in known_ids else None
+    if effective_active_id is None:
+        effective_active_id = next(
+            (entry.id for entry in entries if str(entry.runtime_api_key or "").strip()),
+            entries[0].id,
+        )
+
+    def fetch_entry(entry) -> AccountUsageSnapshot:
+        if not fresh:
+            cached = _pool_usage_cache_get("opencode-go", entry.id)
+            if cached is not None:
+                return cached
+        token = str(entry.runtime_api_key or "").strip()
+        if not token:
+            snapshot = _unavailable_pool_snapshot(
+                "No usable OpenCode Go API key is stored for this account.",
+                provider="opencode-go",
+            )
+        else:
+            try:
+                snapshot = _fetch_opencode_go_account_usage_with_credentials(
+                    token,
+                    str(entry.runtime_base_url or "").strip(),
+                )
+            except httpx.HTTPStatusError as exc:
+                snapshot = _unavailable_pool_snapshot(
+                    "The stored OpenCode Go API key was rejected."
+                    if exc.response.status_code in {401, 403}
+                    else "The OpenCode Go usage service is temporarily unavailable.",
+                    provider="opencode-go",
+                )
+            except Exception:
+                snapshot = _unavailable_pool_snapshot(
+                    "The OpenCode Go usage service is temporarily unavailable.",
+                    provider="opencode-go",
+                )
+        _pool_usage_cache_put("opencode-go", entry.id, snapshot)
+        return snapshot
+
+    # Independent requests are concurrent so two unavailable accounts cost at
+    # most one transport timeout rather than blocking the gateway serially.
+    try:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(entries))) as executor:
+            base_snapshots = list(executor.map(fetch_entry, entries))
+    except Exception:
+        base_snapshots = [fetch_entry(entry) for entry in entries]
+
+    return tuple(
+        replace(
+            snapshot,
+            credential_id=entry.id,
+            account_label=f"OpenCode Go {index}",
+            active=entry.id == effective_active_id,
+        )
+        for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
+    )
+
+
 def fetch_pool_account_usage(
     provider: Optional[str],
     *,
@@ -1233,14 +1349,22 @@ def fetch_pool_account_usage(
     is unchanged: a failing entry still yields an unavailable snapshot while
     the others report live numbers.
 
-    ``opencode-go`` is handled as a single env-backed account: it returns at
-    most one active snapshot resolved from ``OPENCODE_GO_API_KEY`` with NO
-    pool read, selection, refresh, persistence, or routing mutation. ``fresh``
-    and the 60s cache behave identically to the Codex entries.
+    ``opencode-go`` enumerates its persisted pool rows the same read-only way
+    as the Codex entries (raw ``read_credential_pool`` + ``PooledCredential
+    .from_dict`` — never load/select/peek/refresh/persist), fetching each row
+    with its own ``runtime_api_key``/``runtime_base_url`` through the explicit
+    Go transport and labeling it with a safe ordinal (``OpenCode Go N``). When
+    NO pool rows are visible it falls back to the classic single env-backed
+    account (``OPENCODE_GO_API_KEY``), so env-only setups keep working
+    unchanged. ``fresh`` and the 60s cache behave identically to the Codex
+    entries.
     """
     normalized = str(provider or "").strip().lower()
     if normalized == "opencode-go":
-        return _fetch_opencode_go_env_usage_snapshot(fresh=fresh)
+        return _fetch_opencode_go_pool_usage_snapshots(
+            active_entry_id=active_entry_id,
+            fresh=fresh,
+        )
     if normalized != "openai-codex":
         return ()
 
@@ -1503,8 +1627,9 @@ def fetch_aggregate_account_usage(
     yields its own unavailable snapshot. The Codex row→label mapping is
     order/id based and degrades safely on unavailable rows or count mismatch
     (pure ordinals). ``opencode-go`` snapshots are always labeled
-    ``OpenCode-Go-N`` — the env-backed account has no persisted label and the
-    env var name (``OPENCODE_GO_API_KEY``) must never surface.
+    ``OpenCode-Go-N`` — pool rows carry no display-safe label here (a raw
+    label could be email/env-var/token-shaped) and the env var name
+    (``OPENCODE_GO_API_KEY``) must never surface.
     """
     normalized: list[str] = []
     for raw in providers or ():

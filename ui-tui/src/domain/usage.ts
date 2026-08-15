@@ -82,7 +82,10 @@ const openCodeGoWindow = (account: CodexUsageAccount | undefined, kind: 'rolling
 export function formatOpenCodeGoUsage(accounts: CodexUsageAccount[] | undefined): string {
   const visible = (accounts ?? []).filter(account => account.provider === 'opencode-go')
   if (!visible.length) return ''
-  const go = visible[0]
+  // The pool can emit the inactive account before the active one; the status
+  // segment must always reflect the active row when one exists, falling back
+  // to the first row only when no account is active.
+  const go = visible.find(account => account.active) ?? visible[0]
   const fmt = (value: number | null) => (value == null ? '?' : String(value))
   const marker = accountMarker(go)
   return `Go ${marker} ${fmt(remaining(openCodeGoWindow(go, 'rolling')))}/${fmt(remaining(openCodeGoWindow(go, 'weekly')))}/${fmt(remaining(openCodeGoWindow(go, 'monthly')))}`

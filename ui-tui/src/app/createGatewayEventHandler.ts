@@ -759,7 +759,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           ...state,
           info,
           status: state.status === 'starting agent…' ? 'ready' : state.status,
-          usage: info.usage ? { ...state.usage, ...info.usage } : state.usage
+          // accounts are authoritative per provider: the shallow merge keeps
+          // every other usage key cumulative, but a provider that omits
+          // accounts (e.g. a non-Codex model) must clear the previous
+          // provider's stale accounts rather than keep showing them.
+          usage: info.usage ? { ...state.usage, ...info.usage, accounts: info.usage.accounts ?? [] } : state.usage
         }))
 
         setHistoryItems(prev => prev.map(m => (m.kind === 'intro' ? { ...m, info } : m)))

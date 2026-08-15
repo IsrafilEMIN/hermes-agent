@@ -406,8 +406,9 @@ def test_settled_usage_refresh_scheduling_failure_is_fail_open(monkeypatch):
 
 
 # ── OpenCode Go current-provider payload tests (unittest-based) ──────────────
-# The same gateway contract as the Codex pool tests, for the env-backed
-# opencode-go provider: safe payloads, cached/fresh forwarding, strict
+# The same gateway contract as the Codex pool tests, for the pool-aware
+# opencode-go provider (env-only fallback when no pool rows exist): safe
+# payloads, cached/fresh forwarding, active-entry-id forwarding, strict
 # provider gating (a Codex parent never fetches Go and vice versa), and
 # fail-open failures that never leak secrets or internal credential ids.
 
@@ -471,6 +472,24 @@ class OpenCodeGoUsagePayloadTests(unittest.TestCase):
         result = self._snapshot(self._go_agent(), fresh=True, fetch=fake_fetch)
         self.assertEqual(seen, {"provider": "opencode-go", "fresh": True})
         self.assertNotIn("accounts", result)
+
+    def test_opencode_go_forwards_active_entry_id(self):
+        """A pool-backed Go agent's active row id reaches the pool fetch, so
+        the gateway marks the right row ``active`` (mirrors openai-codex)."""
+        agent = SimpleNamespace(provider="opencode-go", _credential_pool_entry_id="entry-x")
+        seen = {}
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            seen.update(provider=provider, active_entry_id=active_entry_id, fresh=fresh)
+            return (_go_snapshot(),)
+
+        result = self._snapshot(agent, fetch=fake_fetch)
+        self.assertEqual(
+            seen,
+            {"provider": "opencode-go", "active_entry_id": "entry-x", "fresh": False},
+        )
+        self.assertEqual(result["accounts"][0]["provider"], "opencode-go")
+        self.assertTrue(result["accounts"][0]["active"])
 
     def test_opencode_go_parent_never_fetches_codex(self):
         calls = []
@@ -572,8 +591,8 @@ class OpenCodeGoUsagePayloadTests(unittest.TestCase):
 # ── Explicit /usage aggregation (session.usage RPC) ─────────────────────────
 # The explicit /usage surface aggregates every configured account across the
 # supported providers (openai-codex + opencode-go) regardless of the session's
-# active provider — so the env-backed OpenCode Go account sits alongside the
-# Codex pool accounts — while the default provider-gated snapshot
+# active provider — so the OpenCode Go account(s) sit alongside the Codex pool
+# accounts — while the default provider-gated snapshot
 # (session.info / status bar / end-of-turn refresh) never aggregates.
 
 

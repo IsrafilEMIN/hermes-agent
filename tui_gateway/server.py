@@ -5282,9 +5282,9 @@ def _session_usage_snapshot(
         if aggregate:
             # Explicit /usage surface (`session.usage` RPC): every configured
             # account across the supported providers (openai-codex +
-            # opencode-go) regardless of the session's active provider — so
-            # the env-backed OpenCode Go account sits alongside the Codex pool
-            # accounts. Fail-open exactly like the provider-gated path below:
+            # opencode-go) regardless of the session's active provider — so the
+            # OpenCode Go account(s) sit alongside the Codex pool accounts.
+            # Fail-open exactly like the provider-gated path below:
             # cosmetic quota telemetry must never break session.usage.
             try:
                 from agent.account_usage import (
@@ -5330,7 +5330,14 @@ def _session_usage_snapshot(
                     fetch_pool_account_usage,
                 )
 
-                snapshots = fetch_pool_account_usage("opencode-go", fresh=fresh)
+                # Forward the session agent's active pool entry so the Go
+                # pool-aware fetch marks the right row ``active`` (mirrors the
+                # openai-codex branch; falls back to None for env-only setups).
+                snapshots = fetch_pool_account_usage(
+                    "opencode-go",
+                    active_entry_id=getattr(agent, "_credential_pool_entry_id", None),
+                    fresh=fresh,
+                )
                 accounts.extend(
                     account_usage_snapshot_to_dict(snapshot) for snapshot in snapshots
                 )

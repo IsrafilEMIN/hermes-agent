@@ -204,6 +204,25 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
     expect(formatOpenCodeGoUsage(inactive)).toBe('Go ○ 90/59/53')
   })
 
+  it('shows the active row when the backend emits an inactive Go account before the active one', () => {
+    const outOfOrder: CodexUsageAccount[] = [
+      {
+        ...goAccounts[0],
+        active: false,
+        windows: [
+          { label: 'Rolling 5h', used_percent: 60 },
+          { label: 'Weekly', used_percent: 90 },
+          { label: 'Monthly', used_percent: 95 }
+        ]
+      },
+      { ...goAccounts[0] } // active, 90/59/53 remaining
+    ]
+
+    // Regression: visible[0] would read the inactive row (`Go ○ 40/10/5`);
+    // the status must reflect the active row's marker and values.
+    expect(formatOpenCodeGoUsage(outOfOrder)).toBe('Go ● 90/59/53')
+  })
+
   it('renders Go ● ?/?/? for an unavailable account', () => {
     const unavailable: CodexUsageAccount[] = [
       {

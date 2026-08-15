@@ -12,8 +12,11 @@ fixed window order, percent used + clamping + reset parsing, ``status``
 ignored, missing/non-dict/malformed payloads, env vs explicit credential
 resolution, official ``/zen/go`` canonicalization, custom base preservation,
 the forbidden ``resolve_runtime_provider`` / ``load_pool`` / ``select`` /
-``peek`` symbols, secret-free snapshots/output, and the ``fetch_pool`` env
-path (missing credential, cache, fresh, failure → unavailable).
+``peek`` symbols, secret-free snapshots/output, and the ``fetch_pool`` path:
+visible manual pool rows (env absent, active marking, per-row failure
+isolation, per-entry-id cache, secret safety, forbidden mutation symbols)
+and the env-only compatibility fallback when no rows are visible (missing
+credential, cache, fresh, failure → unavailable).
 """
 
 from __future__ import annotations
@@ -23,9 +26,11 @@ import contextlib
 import inspect
 import os
 import sys
+import threading
 import types
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest import mock
 
 PROJECT_ROOT = "/workspace/hermes-agent"
@@ -514,6 +519,7 @@ class OpenCodeGoForbiddenSymbolTests(unittest.TestCase):
         account_usage._fetch_opencode_go_account_usage_with_credentials,
         account_usage._fetch_opencode_go_account_usage,
         account_usage._fetch_opencode_go_env_usage_snapshot,
+        account_usage._fetch_opencode_go_pool_usage_snapshots,
     )
 
     @staticmethod
@@ -787,6 +793,362 @@ class OpenCodeGoFetchPoolEnvPathTests(unittest.TestCase):
             self.assertIsNone(account_usage.fetch_account_usage("opencode-go"))
             self.assertIsNone(account_usage.fetch_account_usage("auto"))
             self.assertIsNone(account_usage.fetch_account_usage(None))
+
+
+class _FakePooledCredential:
+    """Mirror of the real ``PooledCredential`` surface the pool path touches.
+
+    The pool path only ever reads ``id``, ``priority``,
+    ``runtime_api_key``, and ``runtime_base_url`` after ``from_dict``, so the
+    fake can be a plain namespace — exactly like the Codex pool tests.
+    """
+
+    @classmethod
+    def from_dict(cls, provider, row):
+        return SimpleNamespace(
+            provider=provider,
+            id=row["id"],
+            priority=row["priority"],
+            runtime_api_key=row.get("access_token", ""),
+            runtime_base_url=row.get("base_url", ""),
+        )
+
+
+class OpenCodeGoPoolRowsTests(unittest.TestCase):
+    """``fetch_pool_account_usage("opencode-go")`` with visible manual rows.
+
+    Mirrors the Codex pool-row tests: enumeration via raw
+    ``read_credential_pool`` + ``PooledCredential.from_dict`` (never
+    load/select/peek), per-row credentials plumbed through the explicit Go
+    transport, per-entry-id cache, independent failure isolation, safe
+    ordinal labels, secret-free serialization, and the env-only fallback when
+    no rows are visible.
+    """
+
+    def setUp(self):
+        account_usage._clear_pool_account_usage_cache_for_tests()
+        _FakeHTTPClient.instances.clear()
+        _FakeHTTPClient.response_queue = []
+        self.rows = [
+            {
+                "id": "entry-a",
+                "priority": 0,
+                "label": "person@example.com",
+                "access_token": "synthetic-token-a",
+                "base_url": "https://go-a.example.com/v1",
+            },
+            {
+                "id": "entry-b",
+                "priority": 1,
+                "label": "OPENCODE_GO_API_KEY",
+                "access_token": "synthetic-token-b",
+                "base_url": "",
+            },
+        ]
+        self.fake_pool_module = types.ModuleType("agent.credential_pool")
+        self.fake_pool_module.PooledCredential = _FakePooledCredential
+
+    def _run(self, fetcher, *, active_entry_id=None, fresh=False, rows=None, clear_env=True):
+        """Run the pool fetch with stubbed rows + transport.
+
+        ``clear_env=True`` (default) removes the OpenCode Go env vars so pool
+        rows are exercised with env absent; fallback tests pass False to keep
+        a configured env credential visible.
+        """
+        with (
+            mock.patch.dict(sys.modules, {"agent.credential_pool": self.fake_pool_module}),
+            mock.patch.object(
+                account_usage,
+                "read_credential_pool",
+                return_value=self.rows if rows is None else rows,
+            ),
+            mock.patch.object(
+                account_usage,
+                "_fetch_opencode_go_account_usage_with_credentials",
+                side_effect=fetcher,
+            ),
+            mock.patch.dict(os.environ),
+        ):
+            if clear_env:
+                os.environ.pop("OPENCODE_GO_API_KEY", None)
+                os.environ.pop("OPENCODE_GO_BASE_URL", None)
+            return account_usage.fetch_pool_account_usage(
+                "opencode-go",
+                active_entry_id=active_entry_id,
+                fresh=fresh,
+            )
+
+    @staticmethod
+    def _snapshot(*, used=22.0, details=("available",)):
+        return account_usage.AccountUsageSnapshot(
+            provider="opencode-go",
+            source="usage_api",
+            fetched_at=account_usage._utc_now(),
+            windows=(account_usage.AccountUsageWindow("Rolling 5h", used_percent=used),),
+            details=details,
+        )
+
+    def test_manual_rows_used_with_env_absent(self):
+        calls = []
+        lock = threading.Lock()
+
+        def fetcher(token, base_url):
+            with lock:
+                calls.append((token, base_url))
+            used = 13.0 if token.endswith("a") else 58.0
+            return self._snapshot(used=used)
+
+        snapshots = self._run(fetcher, active_entry_id="entry-b")
+
+        # Both rows enumerated; each row's own runtime credentials plumbed
+        # through the explicit Go transport, with no env consulted at all.
+        self.assertCountEqual(
+            calls,
+            [
+                ("synthetic-token-a", "https://go-a.example.com/v1"),
+                ("synthetic-token-b", ""),
+            ],
+        )
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual([item.provider for item in snapshots], ["opencode-go", "opencode-go"])
+        # Safe ordinal labels — raw row labels (email / env-var shaped) never
+        # surface.
+        self.assertEqual([item.account_label for item in snapshots], ["OpenCode Go 1", "OpenCode Go 2"])
+        # Active marking follows active_entry_id.
+        self.assertEqual([item.active for item in snapshots], [False, True])
+        self.assertEqual([item.windows[0].used_percent for item in snapshots], [13.0, 58.0])
+        # Internal correlation ids are attached but never serialized.
+        self.assertEqual([item.credential_id for item in snapshots], ["entry-a", "entry-b"])
+
+    def test_active_marking_falls_back_to_first_usable_key(self):
+        def fetcher(token, _base_url):
+            return self._snapshot(used=float(len(token)))
+
+        # No active_entry_id → first row (priority order) with a usable key.
+        snapshots = self._run(fetcher, active_entry_id=None)
+        self.assertEqual([item.active for item in snapshots], [True, False])
+        # Unknown active_entry_id → same fallback.
+        snapshots = self._run(fetcher, active_entry_id="not-a-row")
+        self.assertEqual([item.active for item in snapshots], [True, False])
+
+    def test_row_without_key_is_unavailable_and_never_fetched(self):
+        self.rows[1]["access_token"] = ""
+        calls = []
+
+        def fetcher(token, _base_url):
+            calls.append(token)
+            return self._snapshot()
+
+        snapshots = self._run(fetcher, active_entry_id="entry-b")
+        self.assertEqual(calls, ["synthetic-token-a"])
+        self.assertFalse(snapshots[1].available)
+        self.assertEqual(
+            snapshots[1].unavailable_reason,
+            "No usable OpenCode Go API key is stored for this account.",
+        )
+        # The keyless row can still be marked active (it is the live agent's
+        # row; the display just shows it as unavailable).
+        self.assertTrue(snapshots[1].active)
+
+    def test_failure_isolation_and_cache_keyed_by_entry_id(self):
+        calls = []
+
+        def fetcher(token, _base_url):
+            calls.append(token)
+            if token.endswith("a"):
+                raise RuntimeError("synthetic-token-a must never leak")
+            return self._snapshot(used=58.0)
+
+        # One row's transport failure must not hide the other's numbers.
+        snapshots = self._run(fetcher, active_entry_id="entry-b")
+        self.assertEqual(len(snapshots), 2)
+        self.assertFalse(snapshots[0].available)
+        self.assertNotIn("synthetic-token", snapshots[0].unavailable_reason or "")
+        self.assertEqual(
+            snapshots[0].unavailable_reason,
+            "The OpenCode Go usage service is temporarily unavailable.",
+        )
+        self.assertTrue(snapshots[1].available)
+        self.assertEqual(snapshots[1].windows[0].used_percent, 58.0)
+        self.assertEqual(len(calls), 2)
+
+        # Cached: a second enumeration (different active marking included)
+        # makes NO new transport calls — the cache is keyed by entry id and
+        # the active flag is re-applied per call.
+        snapshots = self._run(fetcher, active_entry_id="entry-a")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([item.active for item in snapshots], [True, False])
+
+    def test_http_401_maps_to_rejected_reason_per_row(self):
+        def fetcher(token, _base_url):
+            if token.endswith("a"):
+                error_cls = account_usage.httpx.HTTPStatusError
+                raise error_cls(
+                    "HTTP status 401",
+                    request=account_usage.httpx.Request("GET", "http://fake.invalid"),
+                    response=_FakeHTTPResponse(status_code=401),
+                )
+            return self._snapshot(used=58.0)
+
+        snapshots = self._run(fetcher)
+        self.assertEqual(
+            snapshots[0].unavailable_reason,
+            "The stored OpenCode Go API key was rejected.",
+        )
+        self.assertTrue(snapshots[1].available)
+
+    def test_fresh_bypasses_cache_and_refreshes_every_row(self):
+        calls = []
+
+        def fetcher(token, _base_url):
+            calls.append(token)
+            used = 13.0 if token.endswith("a") else 58.0
+            return self._snapshot(used=used)
+
+        first = self._run(fetcher)
+        self.assertEqual(len(calls), 2)
+
+        def fresh_fetcher(token, _base_url):
+            calls.append("fresh:" + token)
+            used = 21.0 if token.endswith("a") else 64.0
+            return self._snapshot(used=used)
+
+        refreshed = self._run(fresh_fetcher, fresh=True)
+        self.assertEqual(
+            [item.windows[0].used_percent for item in refreshed], [21.0, 64.0]
+        )
+        # The fresh result replaced the cache: a later cached enumeration
+        # makes no new calls and reports the new numbers.
+        after = self._run(fetcher)
+        self.assertEqual(
+            [item.windows[0].used_percent for item in after], [21.0, 64.0]
+        )
+        self.assertEqual(
+            calls,
+            [
+                "synthetic-token-a",
+                "synthetic-token-b",
+                "fresh:synthetic-token-a",
+                "fresh:synthetic-token-b",
+            ],
+        )
+
+    def test_pool_serialization_is_secret_and_id_safe(self):
+        def fetcher(token, _base_url):
+            return self._snapshot()
+
+        snapshots = self._run(fetcher)
+        payloads = [account_usage.account_usage_snapshot_to_dict(item) for item in snapshots]
+        rendered = repr(payloads)
+        for secret in (
+            "synthetic-token",
+            "entry-a",
+            "entry-b",
+            "person@example.com",
+            "OPENCODE_GO_API_KEY",
+            "go-a.example.com",
+        ):
+            self.assertNotIn(secret, rendered)
+        self.assertNotIn("credential_id", rendered)
+        self.assertEqual([item["label"] for item in payloads], ["OpenCode Go 1", "OpenCode Go 2"])
+        self.assertEqual([item["active"] for item in payloads], [True, False])
+
+    def test_env_fallback_when_no_rows_visible(self):
+        calls = []
+
+        def fetcher(token, base_url):
+            calls.append((token, base_url))
+            return self._snapshot()
+
+        # No rows + env configured → the classic env-only path runs exactly
+        # as before: one active snapshot resolved from the env credentials.
+        with mock.patch.dict(
+            os.environ,
+            {"OPENCODE_GO_API_KEY": _TOKEN, "OPENCODE_GO_BASE_URL": _CUSTOM_BASE},
+        ):
+            snapshots = self._run(fetcher, rows=[], clear_env=False)
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(snapshots[0].active)
+        self.assertIsNone(snapshots[0].credential_id)
+        self.assertIsNone(snapshots[0].account_label)
+        self.assertEqual(calls, [(_TOKEN, _CUSTOM_BASE)])
+
+    def test_pool_read_failure_falls_back_to_env(self):
+        calls = []
+
+        def fetcher(token, base_url):
+            calls.append((token, base_url))
+            return self._snapshot()
+
+        with (
+            mock.patch.dict(sys.modules, {"agent.credential_pool": self.fake_pool_module}),
+            mock.patch.object(
+                account_usage,
+                "read_credential_pool",
+                side_effect=RuntimeError("synthetic pool read failure"),
+            ),
+            mock.patch.object(
+                account_usage,
+                "_fetch_opencode_go_account_usage_with_credentials",
+                side_effect=fetcher,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"OPENCODE_GO_API_KEY": _TOKEN, "OPENCODE_GO_BASE_URL": _CUSTOM_BASE},
+            ),
+        ):
+            snapshots = account_usage.fetch_pool_account_usage("opencode-go")
+        # A pool-read hiccup must never hide a configured env account.
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(snapshots[0].active)
+        self.assertEqual(calls, [(_TOKEN, _CUSTOM_BASE)])
+
+    def test_no_rows_and_no_env_is_empty_pool(self):
+        with mock.patch.dict(sys.modules, {"agent.credential_pool": self.fake_pool_module}):
+            with mock.patch.object(account_usage, "read_credential_pool", return_value=[]):
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("OPENCODE_GO_API_KEY", None)
+                    os.environ.pop("OPENCODE_GO_BASE_URL", None)
+                    self.assertEqual(
+                        account_usage.fetch_pool_account_usage("opencode-go"), ()
+                    )
+
+    def test_pool_rows_never_touch_load_select_or_peek(self):
+        """With rows present, the pool path uses ONLY the raw read + from_dict."""
+
+        def _forbidden(*_a, **_k):
+            raise AssertionError("forbidden credential-pool symbol used by opencode-go path")
+
+        poisoned = types.ModuleType("agent.credential_pool")
+        poisoned.PooledCredential = _FakePooledCredential
+        poisoned.load_pool = _forbidden
+        poisoned.select = _forbidden
+        poisoned.peek = _forbidden
+
+        def fetcher(token, _base_url):
+            return self._snapshot()
+
+        with (
+            mock.patch.dict(sys.modules, {"agent.credential_pool": poisoned}),
+            mock.patch.object(
+                account_usage,
+                "read_credential_pool",
+                return_value=self.rows,
+            ),
+            mock.patch.object(
+                account_usage,
+                "_fetch_opencode_go_account_usage_with_credentials",
+                side_effect=fetcher,
+            ),
+            mock.patch.dict(os.environ),
+        ):
+            os.environ.pop("OPENCODE_GO_API_KEY", None)
+            os.environ.pop("OPENCODE_GO_BASE_URL", None)
+            snapshots = account_usage.fetch_pool_account_usage(
+                "opencode-go", active_entry_id="entry-b"
+            )
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual([item.active for item in snapshots], [False, True])
 
 
 if __name__ == "__main__":
