@@ -41,6 +41,20 @@ type VoiceSubmitMode = 'direct' | 'draft'
 const normalizeVoiceSubmitMode = (value: unknown): VoiceSubmitMode =>
   typeof value === 'string' && value.trim().toLowerCase() === 'draft' ? 'draft' : 'direct'
 
+// Context-file truncation advisories arrive as lifecycle status notes
+// (agent/prompt_builder.py: "⚠️  Context file <name> TRUNCATED: …", surfaced by
+// agent/system_prompt.py via agent._emit_status). They are matched structurally
+// over the whole format so ANY context file (SOUL.md, AGENTS.md, .cursorrules,
+// …) is caught without hard-coding file names, and they are excluded from the
+// prompt-bar status path: rebuilding the system prompt (e.g. every /model
+// switch) re-emits them, and letting them through setStatus would hijack the
+// bar with a long advisory for restoreStatusAfter(4000). They still surface in
+// the activity/transcript.
+const CONTEXT_FILE_TRUNCATION_RE = /^⚠\uFE0F?\s+Context file\s+.+?\s+TRUNCATED:/
+
+export const isContextFileTruncationWarning = (kind: string | undefined, text: string): boolean =>
+  kind === 'lifecycle' && CONTEXT_FILE_TRUNCATION_RE.test(text)
+
 const statusFromBusy = () => (getUiState().busy ? 'running…' : 'ready')
 
 // The last gateway skin, kept so the theme can be re-derived when the OSC-11
@@ -797,6 +811,21 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
           setStatus(brief)
           restoreStatusAfter(6000)
+
+          return
+        }
+
+        // Context-file truncation advisories are lifecycle notes about prompt
+        // content, not prompt-bar state. They re-emit whenever the system
+        // prompt is eagerly rebuilt (e.g. every /model switch); unconditionally
+        // setting the status here hijacks the bar with a long advisory for
+        // restoreStatusAfter(4000). Keep them in the activity/transcript but
+        // leave the prompt-bar status untouched (no set, no restore timer).
+        if (isContextFileTruncationWarning(p.kind, p.text)) {
+          if (turnController.lastStatusNote !== p.text) {
+            turnController.lastStatusNote = p.text
+            turnController.pushActivity(p.text, 'info')
+          }
 
           return
         }

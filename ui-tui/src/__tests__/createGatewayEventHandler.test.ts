@@ -236,6 +236,80 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('⏸ goal paused')
   })
 
+  it('keeps context-file truncation warnings out of the prompt bar but records them in activity (#/model switch)', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+    const warning =
+      '⚠️  Context file AGENTS.md TRUNCATED: 12345 chars exceeds limit of 8000 — trim the file, pin a larger context_file_max_chars, or use a larger-context model!'
+
+    vi.useFakeTimers()
+
+    try {
+      patchUiState({ busy: true, status: 'running…' })
+
+      onEvent({
+        payload: { kind: 'lifecycle', text: warning },
+        type: 'status.update'
+      } as any)
+
+      // Prompt-bar status untouched — no hijack…
+      expect(getUiState().status).toBe('running…')
+
+      // …and no restore timer clobbers it later either.
+      vi.advanceTimersByTime(10_000)
+      expect(getUiState().status).toBe('running…')
+
+      // Warning preserved in the activity/transcript stream, not discarded.
+      expect(getTurnState().activity).toContainEqual(
+        expect.objectContaining({ text: warning, tone: 'info' })
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps context-file truncation warnings out of the prompt bar for any context file name', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ status: 'switching…' })
+
+    onEvent({
+      payload: {
+        kind: 'lifecycle',
+        text: '⚠️  Context file .cursorrules TRUNCATED: 9999 chars exceeds limit of 8000 — trim the file, pin a larger context_file_max_chars, or use a larger-context model!'
+      },
+      type: 'status.update'
+    } as any)
+
+    expect(getUiState().status).toBe('switching…')
+  })
+
+  it('still shows ordinary lifecycle status notes in the prompt bar (control)', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    vi.useFakeTimers()
+
+    try {
+      patchUiState({ busy: true, status: 'running…' })
+
+      onEvent({
+        payload: { kind: 'lifecycle', text: 'Model switched to claude-sonnet-4.5' },
+        type: 'status.update'
+      } as any)
+
+      expect(getUiState().status).toBe('Model switched to claude-sonnet-4.5')
+
+      // Ordinary lifecycle notes still restore to the busy/ready state.
+      vi.advanceTimersByTime(4001)
+      expect(getUiState().status).toBe('running…')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('surfaces self-improvement review summaries as a persistent system line', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
