@@ -406,7 +406,9 @@ describe('AppLayout status-rule visibility', () => {
 
     // The rule is genuinely rendered — the approval prompt pushed it, it did
     // not cover it — so freezing its clock would freeze something visible.
-    expect(layout.output()).toContain('~/repo')
+    // The status verb is the render proof: with no session title the right
+    // slot is blank, so the old '~/repo' marker is gone.
+    expect(layout.output()).toContain('ready')
     expect(layout.output()).toContain('1m 0s')
     expect(oneSecondTimers(intervalSpy)).toBe(2)
 

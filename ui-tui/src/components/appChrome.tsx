@@ -562,11 +562,11 @@ export function StatusRule({
     // shed by tail budgeting (see comment at goUsageText).
     (goUsageText ? stringWidth(' │ ') + stringWidth(goUsageText) : 0)
 
-  // The session-title badge replaces the cwd/workspace label on the right
-  // only while enabled (display.show_session_title). When disabled — or when
-  // no session title exists — the cwd label shows in ordinary label styling.
+  // The session-title badge occupies the far-right slot only while enabled
+  // (display.show_session_title). When disabled — or when no session title
+  // exists — the slot is left blank (no cwd/workspace fallback label).
   const showSessionTitleBadge = showSessionTitle !== false && !!sessionTitle
-  const rightLabel = showSessionTitleBadge ? ` ${sessionTitle} ` : cwdLabel
+  const rightLabel = showSessionTitleBadge ? ` ${sessionTitle} ` : ''
   const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
@@ -913,8 +913,9 @@ interface StatusRuleProps {
   sessionStartedAt?: null | number
   sessionTitle?: string
   /** display.show_session_title: show the session-title badge (accent) in
-   *  place of the cwd label. Absent ⇒ true. Never affects the terminal
-   *  tab/window title. */
+   *  the far-right status-bar slot. When false — or when no session title
+   *  exists — the slot is left blank (no cwd label fallback). Absent ⇒ true.
+   *  Never affects the terminal tab/window title. */
   showSessionTitle?: boolean
   /** display.show_context_label: show the numeric context read-out
    *  (e.g. `50k/200k`) next to the model. Absent ⇒ true. When false only

@@ -142,7 +142,7 @@ describe('StatusRule session title', () => {
     expect(title?.props.bold).toBe(true)
   })
 
-  it('keeps the cwd/workspace label in ordinary label styling when showSessionTitle is off', () => {
+  it('leaves the far-right slot blank when showSessionTitle is off (no cwd fallback)', () => {
     const element = StatusRule({
       ...baseProps,
       sessionTitle: 'weekly-digest',
@@ -150,13 +150,20 @@ describe('StatusRule session title', () => {
     })
 
     const rendered = textContent(element)
-    const cwd = findElementWithText(element, '~/repo')
 
-    expect(rendered).toContain('~/repo')
+    // Neither the session title nor a cwd/workspace fallback label may occupy
+    // the slot (and no dangling separator is left behind).
     expect(rendered).not.toContain('weekly-digest')
-    // Plain label styling — no accent badge treatment.
-    expect(cwd?.props.color).toBe(DEFAULT_THEME.color.label)
-    expect(cwd?.props.bold).not.toBe(true)
+    expect(rendered).not.toContain('~/repo')
+  })
+
+  it('leaves the far-right slot blank when no session title exists', () => {
+    const element = StatusRule({ ...baseProps })
+
+    const rendered = textContent(element)
+
+    // No auto-title means no badge — and no cwd/workspace fallback either.
+    expect(rendered).not.toContain('~/repo')
   })
 })
 
@@ -317,6 +324,7 @@ describe('StatusRule session count click target', () => {
       busy: false,
       cols: 44,
       cwdLabel: '~/src/hermes-agent/apps/desktop (bb/tui-statusbar-responsive)',
+      sessionTitle: 'weekly-digest',
       liveSessionCount: 3,
       model: 'opus-4.8',
       onSessionCountClick: vi.fn(),

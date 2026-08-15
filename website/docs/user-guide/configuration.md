@@ -1739,7 +1739,7 @@ display:
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)
   show_cost: false        # Show estimated $ cost in the CLI status bar
-  show_session_title: true  # TUI status bar: show session title badge instead of the cwd label
+  show_session_title: true  # TUI status bar: show session title badge at the far right (blank when disabled or no title)
   show_context_label: true  # TUI status bar: show the numeric context read-out (e.g. 50k/200k); false hides only the label, keeping the fill bar + percentage
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)
@@ -1756,14 +1756,14 @@ display:
 
 ### Status-bar session title badge
 
-`display.show_session_title` (default `true`) controls the TUI status bar's far-right badge: when the current session has an auto-title, the badge replaces the cwd/workspace label and is rendered in the accent color.
+`display.show_session_title` (default `true`) controls the TUI status bar's far-right badge: when the current session has an auto-title, the badge is rendered there in the accent color.
 
 ```yaml
 display:
-  show_session_title: false  # keep the cwd/workspace label even when a session title exists
+  show_session_title: false  # leave the far-right slot blank even when a session title exists
 ```
 
-Set it to `false` to keep the ordinary cwd/workspace label (in standard label styling) on the status bar even when the session has a title. This setting affects **only the status bar** — the terminal tab/window title (which also shows the session name) is never affected.
+Set it to `false` — or run a session that has no auto-title — and the far-right slot is left blank: the cwd/workspace label is no longer shown there. This setting affects **only the status bar** — the terminal tab/window title (which also shows the session name) is never affected.
 
 ### Status-bar context read-out
 

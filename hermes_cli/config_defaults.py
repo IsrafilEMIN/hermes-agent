@@ -1235,10 +1235,10 @@ DEFAULT_CONFIG = {
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,
         # TUI status bar: show the session's auto-title as the far-right badge
-        # (accent-styled) in place of the cwd/workspace label. When false the
-        # cwd label is shown even if a session title exists. Default true
-        # (backward compatible). Only affects the status bar — never the
-        # terminal tab/window title.
+        # (accent-styled). When false — or when no auto-title exists — the
+        # far-right slot is left blank (no cwd/workspace fallback label).
+        # Default true (backward compatible). Only affects the status bar —
+        # never the terminal tab/window title.
         "show_session_title": True,
         # TUI status bar: show the numeric context read-out (e.g. `12k/200k`,
         # or `12k tok` on narrow terminals) next to the model. When false only
