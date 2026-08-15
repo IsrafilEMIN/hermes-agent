@@ -220,6 +220,79 @@ def test_background_delegation_ends_turn_after_sibling_tool_batch_and_resets():
     assert second["final_response"] == "next turn complete"
 
 
+def test_background_delegation_exception_after_dispatch_ends_turn_without_retry():
+    """A raise inside _execute_tool_calls after a background delegate was
+    dispatched must not let the outer loop take another parent model call.
+
+    The happy-path marker check is skipped when the exception escapes to the
+    outer handler, so the handler must honor the marker itself after filling
+    the missing tool-result rows: end the turn with the delegation exit
+    reason and canned response instead of retrying (a retry would let the
+    parent model re-emit delegate_task and duplicate the delegated work).
+    """
+    agent = _make_agent()
+    batch_calls = [
+        _mock_tool_call(call_id="ran-call", arguments='{"query":"ran"}'),
+        _mock_tool_call(call_id="lost-call", arguments='{"query":"lost"}'),
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=batch_calls),
+        _mock_response(content="must never be reached", finish_reason="stop"),
+    ]
+
+    executed: list[str] = []
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        # Partial execution: the first sibling tool completes and the
+        # background delegate dispatches, then a later sibling raises.
+        executed.append(assistant_message.tool_calls[0].id)
+        messages.append(make_tool_result_message("web_search", "ok", "ran-call"))
+        agent._background_delegation_dispatched = True
+        raise RuntimeError("simulated sibling tool failure after delegation")
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
+    ):
+        result = agent.run_conversation("delegate then fail a sibling tool")
+
+    # No retry: the parent model must never be called again once a
+    # background delegate was dispatched, and no tool re-executes.
+    assert executed == ["ran-call"]
+    assert agent.client.chat.completions.create.call_count == 1
+
+    # The turn ends exactly like the happy-path delegation exit.
+    assert result["turn_exit_reason"] == "background_delegation_dispatched"
+    assert result["final_response"] == (
+        "Background delegation is running. Its result will return automatically "
+        "when complete."
+    )
+
+    # Every emitted tool_call_id has a matching tool result: the executed
+    # sibling keeps its real result; the unexecuted one gets the error fill.
+    tool_rows = [
+        m for m in result["messages"]
+        if isinstance(m, dict) and m.get("role") == "tool"
+    ]
+    assert {m["tool_call_id"] for m in tool_rows} == {"ran-call", "lost-call"}
+    assert next(
+        m for m in tool_rows if m["tool_call_id"] == "ran-call"
+    )["content"] == "ok"
+    lost = next(m for m in tool_rows if m["tool_call_id"] == "lost-call")
+    assert "Error executing tool" in lost["content"]
+
+    # Role alternation stays valid: the assistant tool-call block is
+    # followed only by tool rows, and the finalizer closes the turn with
+    # the canned assistant response.  The exact tail is
+    # assistant(tool_calls) -> tool(ran) -> tool(error-fill) -> assistant(canned);
+    # multiple sibling tool rows in a row are valid, so assert the exact
+    # tail pattern rather than strict alternation.
+    roles = [m["role"] for m in result["messages"]]
+    assert roles[-4:] == ["assistant", "tool", "tool", "assistant"]
+
+
 def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_path):
     """A visible interim assistant row must survive an immediate process exit.
 

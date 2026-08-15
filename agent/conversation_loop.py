@@ -7811,7 +7811,20 @@ def run_conversation(
                             }
                             messages.append(err_msg)
                 break
-            
+
+            # A background delegate may have been dispatched successfully
+            # before the exception (e.g. a sibling tool failed after
+            # delegate_task already dispatched its subagent). The happy-path
+            # marker check above is skipped when the exception escapes, so
+            # honor the marker here instead: the missing tool results have
+            # just been filled, and the turn must end WITHOUT another parent
+            # model call — a retry would let the model re-emit delegate_task
+            # and duplicate the delegated work.
+            if getattr(agent, "_background_delegation_dispatched", False):
+                _turn_exit_reason = "background_delegation_dispatched"
+                final_response = _BACKGROUND_DELEGATION_DISPATCHED_RESPONSE
+                break
+
             # Non-tool errors don't need a synthetic message injected.
             # The error is already printed to the user (line above), and
             # the retry loop continues.  Injecting a fake user/assistant
