@@ -12,8 +12,8 @@ describe('Termux composer prompt + width guards', () => {
     expect(composerPromptText('❯', 'upstr', false, true, 72)).toBe('>')
   })
 
-  it('keeps profile context on very wide Termux panes', () => {
-    expect(composerPromptText('❯', 'upstr', false, true, 120)).toBe('upstr >')
+  it('keeps the ASCII marker on very wide Termux panes', () => {
+    expect(composerPromptText('❯', 'upstr', false, true, 120)).toBe('>')
   })
 
   it('reserves fewer columns for gutter on narrow Termux widths', () => {
