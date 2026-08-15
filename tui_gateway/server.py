@@ -5,6 +5,7 @@ import contextvars
 import copy
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -2727,12 +2728,100 @@ def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
     work". Reconciling before building the payload means the same event that
     already tells the desktop the turn ended also carries the new cwd/branch —
     the client follows it with no new event type and no extra round trip.
+
+    The turn also just consumed quota. The CACHED ``session.info`` is emitted
+    immediately — never blocking the turn loop on an HTTP usage fetch, so a
+    queued prompt's next turn is not delayed — and exactly one bounded
+    background fresh pooled-Codex refresh is scheduled for the turn (see
+    ``_schedule_settled_usage_refresh``); that worker's completion emits the
+    updated ``session.info`` carrying the fresh numbers.
     """
     try:
         _reconcile_session_cwd_from_terminal(session)
     except Exception:
         logger.debug("failed to reconcile settled session cwd", exc_info=True)
     _emit("session.info", sid, _session_info(agent, session))
+    _schedule_settled_usage_refresh(sid, session, agent)
+
+
+# End-of-turn usage refresh bookkeeping. Exactly one bounded background fresh
+# pooled-Codex fetch is scheduled per settled turn; a process-wide MONOTONIC
+# generation makes every schedule strictly newer than the last, so a slow
+# refresh from an older turn can never overwrite a newer turn's emission even
+# when completions land out of order (per-session counters would collide after
+# an entry is pruned; the global counter cannot).
+_settled_usage_refresh_generations: dict[str, int] = {}
+_settled_usage_refresh_lock = threading.Lock()
+_settled_usage_refresh_counter = itertools.count(1)
+
+
+def _schedule_settled_usage_refresh(sid: str, session: dict, agent) -> None:
+    """Schedule the one bounded background fresh pool-usage fetch for this turn.
+
+    Every settled turn schedules exactly one refresh (one call per end-of-turn
+    emission, each bumping the session's monotonic generation). The fetch runs
+    on the shared bounded ``_pool`` executor — never a fresh thread per turn —
+    and refreshes only pooled Codex usage via ``_session_usage_snapshot`` with
+    ``fresh=True`` (no Nous fetch, no auth mutation, no polling). Fail-open: if
+    the executor rejects the task (e.g. gateway shutdown) the refresh is
+    dropped and the cached numbers already emitted stand.
+    """
+    generation = next(_settled_usage_refresh_counter)
+    with _settled_usage_refresh_lock:
+        _settled_usage_refresh_generations[sid] = generation
+    try:
+        _pool.submit(_run_settled_usage_refresh, sid, session, agent, generation)
+    except Exception:
+        with _settled_usage_refresh_lock:
+            if _settled_usage_refresh_generations.get(sid) == generation:
+                _settled_usage_refresh_generations.pop(sid, None)
+        logger.debug("settled usage refresh scheduling failed", exc_info=True)
+
+
+def _run_settled_usage_refresh(sid: str, session: dict, agent, generation: int) -> None:
+    """Background worker: fetch fresh pooled usage and re-emit ``session.info``.
+
+    Runs on the bounded ``_pool`` executor. Failure is fail-open: the turn's
+    cached ``session.info`` already emitted stays the source of truth, and no
+    secret ever leaves this path (the payload is the same secret-safe
+    ``session.info`` shape as every other emission). The final emit is
+    suppressed when the refresh is stale — a newer settled turn scheduled its
+    own refresh, or the session/agent are no longer the live ones — so
+    out-of-order completions can never overwrite newer session state or
+    account data.
+    """
+    try:
+        try:
+            usage = _session_usage_snapshot(session, fresh=True)
+        except Exception:
+            logger.debug("settled usage refresh fetch failed", exc_info=True)
+            return
+        if _settled_usage_refresh_is_stale(sid, session, agent, generation):
+            return
+        try:
+            _emit("session.info", sid, _session_info(agent, session, usage=usage))
+        except Exception:
+            logger.debug("settled usage refresh emit failed", exc_info=True)
+    finally:
+        # The CURRENT generation's worker owns the bookkeeping entry: drop it
+        # once it has run (any completion path) so the map stays bounded.
+        # Stale generations never match — the counter is process-wide
+        # monotonic — so they cannot pop a newer entry.
+        with _settled_usage_refresh_lock:
+            if _settled_usage_refresh_generations.get(sid) == generation:
+                _settled_usage_refresh_generations.pop(sid, None)
+
+
+def _settled_usage_refresh_is_stale(sid: str, session: dict, agent, generation: int) -> bool:
+    """True when a refresh must not emit: superseded or its session is gone."""
+    with _settled_usage_refresh_lock:
+        if _settled_usage_refresh_generations.get(sid) != generation:
+            return True
+    with _sessions_lock:
+        live = _sessions.get(sid)
+    if live is not session or live.get("agent") is not agent:
+        return True
+    return False
 
 
 def _session_source(session: dict | None) -> str:
@@ -5181,13 +5270,33 @@ def _current_profile_name() -> str:
 DESKTOP_BACKEND_CONTRACT = 6
 
 
-def _session_usage_snapshot(session: dict | None) -> dict:
+def _session_usage_snapshot(session: dict | None, *, fresh: bool = False) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
         return dict(mirror_usage)
     if agent is not None:
-        return _get_usage(agent)
+        usage = dict(_get_usage(agent))
+        if str(getattr(agent, "provider", "") or "").strip().lower() == "openai-codex":
+            try:
+                from agent.account_usage import (
+                    account_usage_snapshot_to_dict,
+                    fetch_pool_account_usage,
+                )
+
+                snapshots = fetch_pool_account_usage(
+                    "openai-codex",
+                    active_entry_id=getattr(agent, "_credential_pool_entry_id", None),
+                    fresh=fresh,
+                )
+                if snapshots:
+                    usage["accounts"] = [
+                        account_usage_snapshot_to_dict(snapshot) for snapshot in snapshots
+                    ]
+            except Exception:
+                # Cosmetic quota telemetry must never break session.info/usage.
+                logger.debug("pool account usage snapshot failed", exc_info=True)
+        return usage
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 
 
@@ -5220,7 +5329,13 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
         return None
 
 
-def _session_info(agent, session: dict | None = None) -> dict:
+def _session_info(
+    agent,
+    session: dict | None = None,
+    *,
+    fresh_usage: bool = False,
+    usage: dict | None = None,
+) -> dict:
     if session is None:
         for candidate in _sessions.values():
             if candidate.get("agent") is agent:
@@ -5295,7 +5410,12 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "release_date": "",
         "update_behind": None,
         "update_command": "",
-        "usage": _session_usage_snapshot(session),
+        # ``usage`` lets a caller inject an already-fetched snapshot (the
+        # end-of-turn background refresh passes what it just fetched, so the
+        # completion emit performs exactly one fresh fetch, not two).
+        "usage": (
+            usage if usage is not None else _session_usage_snapshot(session, fresh=fresh_usage)
+        ),
         "profile_name": _response_profile_name(
             Path(session["profile_home"]).name
             if isinstance(session, dict) and session.get("profile_home")

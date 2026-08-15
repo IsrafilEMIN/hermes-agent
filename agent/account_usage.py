@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
-from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
+from hermes_cli.auth import (
+    AuthError,
+    _decode_jwt_claims,
+    _read_codex_tokens,
+    read_credential_pool,
+    resolve_codex_runtime_credentials,
+)
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 if TYPE_CHECKING:
@@ -40,6 +48,13 @@ class AccountUsageSnapshot:
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
     unavailable_reason: Optional[str] = None
+    # Pool-aware metadata (optional, safe display/internal fields only). Never
+    # populated by the single-account fetch paths, so those snapshots are
+    # byte-identical to before. ``credential_id`` is an INTERNAL correlation
+    # id — it must never be emitted by secret-safe serializers.
+    credential_id: Optional[str] = None
+    account_label: Optional[str] = None
+    active: bool = False
 
     @property
     def available(self) -> bool:
@@ -507,11 +522,42 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
-def _fetch_codex_account_usage(
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> Optional[AccountUsageSnapshot]:
-    token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
+_CODEX_SESSION_WINDOW_SECONDS = 5 * 3600
+_CODEX_WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600
+_CODEX_WINDOW_DURATION_TOLERANCE = 0.1
+
+
+def _codex_window_label(key: str, window: dict[str, Any]) -> str:
+    """Classify known Codex windows by duration, with key-based fallback."""
+    duration = window.get("limit_window_seconds")
+    if not _is_finite_num(duration):
+        duration = window.get("limit_seconds")
+    if _is_finite_num(duration):
+        for seconds, label in (
+            (_CODEX_WEEKLY_WINDOW_SECONDS, "Weekly"),
+            (_CODEX_SESSION_WINDOW_SECONDS, "Session"),
+        ):
+            if abs(duration / seconds - 1.0) <= _CODEX_WINDOW_DURATION_TOLERANCE:
+                return label
+    return "Session" if key == "primary_window" else "Weekly"
+
+
+def _fetch_codex_account_usage_with_credentials(
+    token: str,
+    base_url: Optional[str],
+    account_id: Optional[str] = None,
+) -> AccountUsageSnapshot:
+    """Fetch + parse Codex quota usage with EXPLICIT credentials.
+
+    The factored transport/parser half of the Codex usage fetch: it takes a
+    concrete token/base_url (never resolves anything itself) and performs the
+    GET against the usage endpoint, then maps the payload into an
+    ``AccountUsageSnapshot``. Shared by the single-account path
+    (``_fetch_codex_account_usage``) and the pool-aware path
+    (``fetch_pool_account_usage``), so both surfaces render identical
+    windows/details. Raises on transport/HTTP errors — callers decide how to
+    fail open.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -520,19 +566,19 @@ def _fetch_codex_account_usage(
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
     with httpx.Client(timeout=15.0) as client:
-        response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
+        response = client.get(_resolve_codex_usage_url(base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key in ("primary_window", "secondary_window"):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
             continue
         windows.append(
             AccountUsageWindow(
-                label=label,
+                label=_codex_window_label(key, window),
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
             )
@@ -561,6 +607,26 @@ def _fetch_codex_account_usage(
         windows=tuple(windows),
         details=tuple(details),
     )
+
+
+def _chatgpt_account_id_from_token(token: str) -> Optional[str]:
+    """Best-effort account binding for a concrete Codex OAuth JWT."""
+    claims = _decode_jwt_claims(token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claims, dict):
+        return None
+    account_id = auth_claims.get("chatgpt_account_id")
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None
+    return account_id.strip()
+
+
+def _fetch_codex_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
+    return _fetch_codex_account_usage_with_credentials(token, resolved_base_url, account_id)
 
 
 @dataclass(frozen=True)
@@ -900,3 +966,177 @@ def fetch_account_usage(
     except Exception:
         return None
     return None
+
+
+_POOL_USAGE_CACHE_TTL_SECONDS = 60.0
+_POOL_USAGE_CACHE: dict[tuple[str, str], tuple[float, AccountUsageSnapshot]] = {}
+_POOL_USAGE_CACHE_LOCK = threading.Lock()
+
+
+def _clear_pool_account_usage_cache_for_tests() -> None:
+    """Clear the process-local quota cache used by synthetic tests."""
+    with _POOL_USAGE_CACHE_LOCK:
+        _POOL_USAGE_CACHE.clear()
+
+
+def _pool_usage_cache_get(provider: str, credential_id: str) -> Optional[AccountUsageSnapshot]:
+    now = time.monotonic()
+    key = (provider, credential_id)
+    with _POOL_USAGE_CACHE_LOCK:
+        cached = _POOL_USAGE_CACHE.get(key)
+        if cached is None:
+            return None
+        deadline, snapshot = cached
+        if deadline <= now:
+            _POOL_USAGE_CACHE.pop(key, None)
+            return None
+        return snapshot
+
+
+def _pool_usage_cache_put(provider: str, credential_id: str, snapshot: AccountUsageSnapshot) -> None:
+    now = time.monotonic()
+    with _POOL_USAGE_CACHE_LOCK:
+        # Bound stale-key growth when credentials are removed/re-added.
+        for key, (deadline, _snapshot) in list(_POOL_USAGE_CACHE.items()):
+            if deadline <= now:
+                _POOL_USAGE_CACHE.pop(key, None)
+        _POOL_USAGE_CACHE[(provider, credential_id)] = (
+            now + _POOL_USAGE_CACHE_TTL_SECONDS,
+            snapshot,
+        )
+
+
+def _unavailable_pool_snapshot(reason: str) -> AccountUsageSnapshot:
+    return AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=_utc_now(),
+        unavailable_reason=reason,
+    )
+
+
+def fetch_pool_account_usage(
+    provider: Optional[str],
+    *,
+    active_entry_id: Optional[str] = None,
+    fresh: bool = False,
+) -> tuple[AccountUsageSnapshot, ...]:
+    """Fetch Codex limits for every persisted pool row without mutating auth.
+
+    This inspection path deliberately reads raw persisted rows instead of
+    ``load_pool()``: loading can seed/normalize and write the credential store,
+    while selection can rotate routing. It also never refreshes OAuth tokens.
+    Expired/rejected standby credentials therefore appear as unavailable until
+    normal inference routing refreshes them.
+
+    ``fresh=True`` bypasses the per-entry 60s cache: every entry is fetched
+    from the backend, and the fresh result is written back through the cache so
+    later cached emissions immediately see the new numbers (the stale entry is
+    invalidated, not just skipped). This is the end-of-turn surface — the
+    caller decides when a completed turn's quota change is worth a fetch — and
+    deliberately adds no polling or auth refresh of its own. Failure isolation
+    is unchanged: a failing entry still yields an unavailable snapshot while
+    the others report live numbers.
+    """
+    normalized = str(provider or "").strip().lower()
+    if normalized != "openai-codex":
+        return ()
+
+    try:
+        from agent.credential_pool import PooledCredential
+
+        raw_rows = read_credential_pool(normalized)
+        entries = [
+            PooledCredential.from_dict(normalized, row)
+            for row in raw_rows
+            if isinstance(row, dict)
+        ]
+    except Exception:
+        return ()
+
+    entries.sort(key=lambda entry: (int(entry.priority or 0), str(entry.id)))
+    if not entries:
+        return ()
+
+    known_ids = {entry.id for entry in entries}
+    effective_active_id = active_entry_id if active_entry_id in known_ids else None
+    if effective_active_id is None:
+        effective_active_id = next(
+            (entry.id for entry in entries if str(entry.runtime_api_key or "").strip()),
+            entries[0].id,
+        )
+
+    def fetch_entry(entry) -> AccountUsageSnapshot:
+        if not fresh:
+            cached = _pool_usage_cache_get(normalized, entry.id)
+            if cached is not None:
+                return cached
+        token = str(entry.runtime_api_key or "").strip()
+        if not token:
+            snapshot = _unavailable_pool_snapshot("No usable OAuth access token is stored for this account.")
+        else:
+            try:
+                snapshot = _fetch_codex_account_usage_with_credentials(
+                    token,
+                    str(entry.runtime_base_url or "").strip(),
+                    _chatgpt_account_id_from_token(token),
+                )
+            except httpx.HTTPStatusError as exc:
+                snapshot = _unavailable_pool_snapshot(
+                    "The stored OAuth credential was rejected."
+                    if exc.response.status_code in {401, 403}
+                    else "The Codex usage service is temporarily unavailable."
+                )
+            except Exception:
+                snapshot = _unavailable_pool_snapshot(
+                    "The Codex usage service is temporarily unavailable."
+                )
+        _pool_usage_cache_put(normalized, entry.id, snapshot)
+        return snapshot
+
+    # Independent requests are concurrent so two unavailable accounts cost at
+    # most one transport timeout rather than blocking the gateway serially.
+    try:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(entries))) as executor:
+            base_snapshots = list(executor.map(fetch_entry, entries))
+    except Exception:
+        base_snapshots = [fetch_entry(entry) for entry in entries]
+
+    return tuple(
+        replace(
+            snapshot,
+            credential_id=entry.id,
+            account_label=f"Codex {index}",
+            active=entry.id == effective_active_id,
+        )
+        for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
+    )
+
+
+def account_usage_snapshot_to_dict(snapshot: AccountUsageSnapshot) -> dict[str, Any]:
+    """Serialize an account snapshot without credential identifiers or secrets."""
+    return {
+        "success": True,
+        "available": snapshot.available,
+        "provider": snapshot.provider,
+        "source": snapshot.source,
+        "title": snapshot.title,
+        "plan": snapshot.plan,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "label": snapshot.account_label,
+        "active": snapshot.active,
+        "windows": [
+            {
+                "label": window.label,
+                "used_percent": window.used_percent,
+                "reset_at": window.reset_at.isoformat() if window.reset_at else None,
+                "reset_human": _format_reset(window.reset_at) if window.reset_at else None,
+                "detail": window.detail,
+            }
+            for window in snapshot.windows
+        ],
+        "details": list(snapshot.details),
+        "unavailable_reason": snapshot.unavailable_reason,
+    }
