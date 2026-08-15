@@ -300,6 +300,42 @@ describe('StatusRule session count click target', () => {
 
     expect(textContent(element)).toContain('Codex min 42% · 2')
   })
+
+  it('shows active/inactive account markers without C1/C2 identifiers on wide terminals', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 120,
+      usage: {
+        ...baseProps.usage,
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Codex 1',
+            provider: 'openai-codex',
+            windows: [
+              { label: 'Session', used_percent: 13 },
+              { label: 'Weekly', used_percent: 36 }
+            ]
+          },
+          {
+            active: false,
+            available: true,
+            label: 'Codex 2',
+            provider: 'openai-codex',
+            windows: [
+              { label: 'Session', used_percent: 58 },
+              { label: 'Weekly', used_percent: 9 }
+            ]
+          }
+        ]
+      }
+    })
+
+    const rendered = textContent(element)
+    expect(rendered).toContain('● S87 W64 │ ○ S42 W91')
+    expect(rendered).not.toMatch(/C[12]/)
+  })
 })
 
 describe('StatusRule credits notice render priority', () => {

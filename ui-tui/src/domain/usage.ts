@@ -34,13 +34,12 @@ export function formatCodexUsage(accounts: CodexUsageAccount[] | undefined, cols
   }
 
   return visible
-    .map((account, index) => {
-      const code = `C${index + 1}`
+    .map(account => {
       const session = remaining(windowFor(account, 'session'))
       const weekly = remaining(windowFor(account, 'weekly'))
       const marker = accountMarker(account)
-      if (cols < 100) return `${marker}${code} ${session ?? '?'}/${weekly ?? '?'}`
-      return `${marker}${code} S${session ?? '?'} W${weekly ?? '?'}`
+      if (cols < 100) return `${marker} ${session ?? '?'}/${weekly ?? '?'}`
+      return `${marker} S${session ?? '?'} W${weekly ?? '?'}`
     })
     .join(cols < 100 ? ' ' : ' │ ')
 }

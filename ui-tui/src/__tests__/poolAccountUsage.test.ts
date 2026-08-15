@@ -28,9 +28,23 @@ const accounts: CodexUsageAccount[] = [
 
 describe('pool-aware Codex usage formatting', () => {
   it('renders wide, medium, and narrow layouts from remaining percentages', () => {
-    expect(formatCodexUsage(accounts, 120)).toBe('●C1 S87 W64 │ ○C2 S42 W91')
-    expect(formatCodexUsage(accounts, 80)).toBe('●C1 87/64 ○C2 42/91')
+    expect(formatCodexUsage(accounts, 120)).toBe('● S87 W64 │ ○ S42 W91')
+    expect(formatCodexUsage(accounts, 80)).toBe('● 87/64 ○ 42/91')
     expect(formatCodexUsage(accounts, 60)).toBe('Codex min 42% · 2')
+  })
+
+  it('drops C1/C2 identifiers from status output but keeps them in the detail panel', () => {
+    const wide = formatCodexUsage(accounts, 120)
+    const medium = formatCodexUsage(accounts, 80)
+
+    expect(wide).not.toMatch(/C[12]/)
+    expect(medium).not.toMatch(/C[12]/)
+    expect(wide).toBe('● S87 W64 │ ○ S42 W91')
+    expect(medium).toBe('● 87/64 ○ 42/91')
+
+    const details = codexUsageDetails(accounts).join('\n')
+    expect(details).toContain('● Codex 1 (active)')
+    expect(details).toContain('○ Codex 2')
   })
 
   it('marks exhausted and unavailable accounts without hiding peers', () => {
@@ -45,7 +59,8 @@ describe('pool-aware Codex usage formatting', () => {
         windows: []
       }
     ]
-    expect(formatCodexUsage(mixed, 120)).toBe('!C1 S0 W? │ ?C2 S? W?')
+    expect(formatCodexUsage(mixed, 120)).toBe('! S0 W? │ ? S? W?')
+    expect(formatCodexUsage(mixed, 80)).toBe('! 0/? ? ?/?')
     expect(codexUsageDetails(mixed).join('\n')).toContain('? Codex 2')
     expect(codexUsageDetails(mixed).join('\n')).toContain('stored OAuth credential was rejected')
   })
