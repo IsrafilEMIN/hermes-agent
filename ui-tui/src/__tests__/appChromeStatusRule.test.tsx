@@ -599,3 +599,108 @@ describe('StatusRule idle-since read-out', () => {
     expect(findComponentByName(element, 'IdleSince')).toBeNull()
   })
 })
+
+describe('StatusRule OpenCode Go segment', () => {
+  const goAccounts = [
+    {
+      active: true,
+      available: true,
+      label: 'Go 1',
+      provider: 'opencode-go',
+      windows: [
+        { label: 'Rolling 5h', used_percent: 10, reset_human: 'in 2h' },
+        { label: 'Weekly', used_percent: 41 },
+        { label: 'Monthly', used_percent: 47 }
+      ]
+    }
+  ]
+
+  // Synthetic payload with the Go account FIRST — the render order must be
+  // provider-fixed (Codex then Go), not payload order.
+  const bothProviders = [
+    ...goAccounts,
+    {
+      active: true,
+      available: true,
+      label: 'Codex 1',
+      provider: 'openai-codex',
+      windows: [
+        { label: 'Session', used_percent: 13 },
+        { label: 'Weekly', used_percent: 36 }
+      ]
+    },
+    {
+      active: false,
+      available: true,
+      label: 'Codex 2',
+      provider: 'openai-codex',
+      windows: [
+        { label: 'Session', used_percent: 58 },
+        { label: 'Weekly', used_percent: 9 }
+      ]
+    }
+  ]
+
+  it('renders the full Go r/w/m read-out pinned on wide and medium terminals', () => {
+    const wide = textContent(
+      StatusRule({ ...baseProps, cols: 120, usage: { ...baseProps.usage, accounts: [...goAccounts] } })
+    )
+    const medium = textContent(
+      StatusRule({ ...baseProps, cols: 80, usage: { ...baseProps.usage, accounts: [...goAccounts] } })
+    )
+
+    expect(wide).toContain('Go 90/59/53')
+    expect(medium).toContain('Go 90/59/53')
+  })
+
+  it('stays full-form on a narrow terminal where the Codex read-out collapses', () => {
+    const rendered = textContent(
+      StatusRule({ ...baseProps, cols: 60, usage: { ...baseProps.usage, accounts: [...bothProviders] } })
+    )
+
+    // Codex collapses to the min-percentage form below 72 cols …
+    expect(rendered).toContain('Codex min 42% · 2')
+    // … but Go is pinned in the essential slot: the full r/w/m form survives.
+    expect(rendered).toContain('Go 90/59/53')
+  })
+
+  it('renders Codex then Go in fixed order regardless of payload order', () => {
+    const rendered = textContent(
+      StatusRule({ ...baseProps, cols: 120, usage: { ...baseProps.usage, accounts: [...bothProviders] } })
+    )
+
+    // Go sits in the payload BEFORE the Codex accounts, yet the bar still
+    // emits the Codex segment first, then the Go segment, sharing one
+    // separator — provider-fixed order.
+    expect(rendered).toContain('● 87/64 ○ 42/91 │ Go 90/59/53')
+    expect(rendered.indexOf('● 87/64')).toBeLessThan(rendered.indexOf('Go 90/59/53'))
+  })
+
+  it('shows no Go segment when the payload has no opencode-go account', () => {
+    const noAccounts = textContent(StatusRule({ ...baseProps }))
+    const emptyAccounts = textContent(
+      StatusRule({ ...baseProps, usage: { ...baseProps.usage, accounts: [] } })
+    )
+    const codexOnly = textContent(
+      StatusRule({
+        ...baseProps,
+        usage: { ...baseProps.usage, accounts: [...bothProviders].filter(a => a.provider !== 'opencode-go') }
+      })
+    )
+
+    expect(noAccounts).not.toContain('Go ')
+    expect(emptyAccounts).not.toContain('Go ')
+    expect(codexOnly).not.toContain('Go ')
+  })
+
+  it('renders only the Go segment (no Codex markers) for a Go-only payload', () => {
+    const rendered = textContent(
+      StatusRule({ ...baseProps, cols: 80, usage: { ...baseProps.usage, accounts: [...goAccounts] } })
+    )
+
+    expect(rendered).toContain('Go 90/59/53')
+    expect(rendered).not.toContain('●')
+    expect(rendered).not.toContain('○')
+    expect(rendered).not.toContain('Codex')
+  })
+})

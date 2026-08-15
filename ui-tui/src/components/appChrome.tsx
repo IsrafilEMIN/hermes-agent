@@ -11,7 +11,7 @@ import { DEV_CREDITS_MODE } from '../config/env.js'
 import { FACES } from '../content/faces.js'
 import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
-import { formatCodexUsage } from '../domain/usage.js'
+import { formatCodexUsage, formatOpenCodeGoUsage } from '../domain/usage.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
@@ -506,6 +506,13 @@ export function StatusRule({
   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
   const codexUsageText = formatCodexUsage(usage.accounts, cols)
+  // OpenCode Go quota rides its own status segment (never mixed into the
+  // Codex read-out). The gateway gates accounts to the current provider, so
+  // Go is the current provider's quota whenever it appears — pinned in the
+  // same account-usage essential slot as Codex (separator + width reserved in
+  // essentialWidth, rendered unconditionally when nonempty) instead of being
+  // tail-budgeted away on a narrow terminal.
+  const goUsageText = formatOpenCodeGoUsage(usage.accounts)
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery = !!battery && battery.available && battery.percent != null
@@ -543,7 +550,10 @@ export function StatusRule({
     stringWidth(' │ ') +
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0) +
-    (codexUsageText ? stringWidth(' │ ') + stringWidth(codexUsageText) : 0)
+    (codexUsageText ? stringWidth(' │ ') + stringWidth(codexUsageText) : 0) +
+    // Go is pinned like Codex: the current provider's quota must never be
+    // shed by tail budgeting (see comment at goUsageText).
+    (goUsageText ? stringWidth(' │ ') + stringWidth(goUsageText) : 0)
 
   // The session-title badge replaces the cwd/workspace label on the right
   // only while enabled (display.show_session_title). When disabled — or when
@@ -691,6 +701,12 @@ export function StatusRule({
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
             {codexUsageText}
+          </Text>
+        ) : null}
+        {goUsageText ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {goUsageText}
           </Text>
         ) : null}
         {showBar ? (

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import re
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -947,6 +950,149 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+# ── OpenCode Go (env-backed, read-only) ──────────────────────────────────────
+
+_OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
+_OPENCODE_GO_WINDOW_SPECS = (
+    ("rolling", "Rolling 5h"),
+    ("weekly", "Weekly"),
+    ("monthly", "Monthly"),
+)
+
+
+def _canonical_opencode_go_base_url(base_url: Optional[str]) -> str:
+    """Canonicalize the OpenCode Go usage base URL.
+
+    The usage endpoint lives at ``<base>/usage`` under the SAME ``/v1`` root
+    as the OpenAI-compatible inference endpoints, so the canonical official
+    base is ``https://opencode.ai/zen/go/v1``.  Known official variants —
+    ``https://opencode.ai/zen/go`` and any trailing-slash form, with or
+    without the ``/v1`` suffix — normalize to that canonical URL, and an
+    empty value falls back to it.  Anything else (custom proxy overrides via
+    ``OPENCODE_GO_BASE_URL`` or an explicit base) is returned untouched: the
+    operator owns that layout, and a usage GET must not silently relocate it.
+    """
+    url = str(base_url or "").strip().rstrip("/")
+    if not url:
+        return _OPENCODE_GO_DEFAULT_BASE_URL
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return url
+    if (
+        parsed.netloc.lower() == "opencode.ai"
+        and parsed.path.rstrip("/") in {"/zen/go", "/zen/go/v1"}
+        and not parsed.query
+        and not parsed.fragment
+    ):
+        return _OPENCODE_GO_DEFAULT_BASE_URL
+    return url
+
+
+def _resolve_opencode_go_usage_credentials(
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> tuple[str, str]:
+    """Resolve OpenCode Go usage credentials with strict read-only reads.
+
+    Prefer explicit live-agent credentials; otherwise read the env-backed
+    ``OPENCODE_GO_API_KEY`` / ``OPENCODE_GO_BASE_URL`` variables directly and
+    canonicalize the official base form.  Deliberately does NOT call
+    ``resolve_runtime_provider``: that chain can seed/select the credential
+    pool and re-derives ``api_mode`` from the effective model, which strips
+    the ``/v1`` suffix from the official base for anthropic-routed Go models
+    (e.g. minimax/qwen) — the usage GET would then hit
+    ``https://opencode.ai/zen/go/usage`` instead of the canonical
+    ``https://opencode.ai/zen/go/v1/usage``.  Never loads, selects, peeks,
+    refreshes, or persists any credential.  The token is never logged.
+    """
+    explicit_key = str(api_key or "").strip()
+    token = explicit_key or str(os.getenv("OPENCODE_GO_API_KEY") or "").strip()
+    if not token:
+        raise RuntimeError("No OpenCode Go API key configured (set OPENCODE_GO_API_KEY)")
+    explicit_base = str(base_url or "").strip()
+    base = explicit_base or str(os.getenv("OPENCODE_GO_BASE_URL") or "").strip()
+    return token, _canonical_opencode_go_base_url(base)
+
+
+def _fetch_opencode_go_account_usage_with_credentials(
+    token: str,
+    base_url: Optional[str],
+) -> AccountUsageSnapshot:
+    """Fetch + parse OpenCode Go usage with EXPLICIT credentials.
+
+    The factored transport/parser half of the OpenCode Go usage fetch: takes a
+    concrete token/base_url (never resolves anything itself) and performs the
+    GET against the ``/usage`` endpoint, then maps the payload into an
+    ``AccountUsageSnapshot``. Shared by the single-account path
+    (``_fetch_opencode_go_account_usage``) and the env pool path
+    (``fetch_pool_account_usage``), so both surfaces render identical windows.
+    Raises on transport/HTTP errors — callers decide how to fail open.
+
+    Payload contract (verified live): ``{"usage": {monthly|rolling|weekly:
+    {"percent": <used %>, "resetsAt": <ISO-8601>, "status": <arbitrary
+    string>}}}``. ``percent`` is the used percent, clamped to [0, 100];
+    ``status`` is informational and intentionally ignored.  The payload must
+    be a dict: a malformed (non-dict) body yields a safe unavailable
+    snapshot instead of crashing, and a dict with no parseable windows yields
+    an empty-windows snapshot the status formatter renders as ``?``.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "hermes",
+    }
+    normalized = _canonical_opencode_go_base_url(base_url)
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(f"{normalized}/usage", headers=headers)
+        response.raise_for_status()
+    try:
+        raw = response.json()
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict):
+        return AccountUsageSnapshot(
+            provider="opencode-go",
+            source="usage_api",
+            fetched_at=_utc_now(),
+            unavailable_reason="The OpenCode Go usage service returned an unexpected response.",
+        )
+    usage = raw.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    windows: list[AccountUsageWindow] = []
+    for key, label in _OPENCODE_GO_WINDOW_SPECS:
+        window = usage.get(key)
+        if not isinstance(window, dict):
+            continue
+        percent = window.get("percent")
+        if not _is_finite_num(percent):
+            continue
+        windows.append(
+            AccountUsageWindow(
+                label=label,
+                # percent is the USED percent; clamp so out-of-range backend
+                # values never render as a falsely-confident negative gauge.
+                used_percent=max(0.0, min(100.0, float(percent))),
+                reset_at=_parse_dt(window.get("resetsAt")),
+            )
+        )
+    return AccountUsageSnapshot(
+        provider="opencode-go",
+        source="usage_api",
+        fetched_at=_utc_now(),
+        windows=tuple(windows),
+    )
+
+
+def _fetch_opencode_go_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    token, resolved_base_url = _resolve_opencode_go_usage_credentials(base_url, api_key)
+    return _fetch_opencode_go_account_usage_with_credentials(token, resolved_base_url)
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -963,6 +1109,8 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        if normalized == "opencode-go":
+            return _fetch_opencode_go_account_usage(base_url=base_url, api_key=api_key)
     except Exception:
         return None
     return None
@@ -1006,13 +1154,60 @@ def _pool_usage_cache_put(provider: str, credential_id: str, snapshot: AccountUs
         )
 
 
-def _unavailable_pool_snapshot(reason: str) -> AccountUsageSnapshot:
+def _unavailable_pool_snapshot(reason: str, *, provider: str = "openai-codex") -> AccountUsageSnapshot:
     return AccountUsageSnapshot(
-        provider="openai-codex",
+        provider=provider,
         source="usage_api",
         fetched_at=_utc_now(),
         unavailable_reason=reason,
     )
+
+
+# Stable internal cache key for the single env-backed OpenCode Go account.
+# Provider-specific by construction (the cache tuple is (provider, key)) and
+# never serialized: the pool path below never copies it onto a snapshot.
+_OPENCODE_GO_ENV_CACHE_KEY = "env"
+
+
+def _fetch_opencode_go_env_usage_snapshot(*, fresh: bool) -> tuple[AccountUsageSnapshot, ...]:
+    """Fetch the ONE env-backed OpenCode Go account into a singleton snapshot.
+
+    Read-only by design: credential resolution is a strict env read
+    (``OPENCODE_GO_API_KEY`` / ``OPENCODE_GO_BASE_URL``) with no pool
+    load/select/peek, no refresh/persistence, and no runtime-provider
+    api-mode normalization (which would strip ``/v1`` from the official base
+    for anthropic-routed Go models and point the usage GET at the wrong
+    path).  No credential is configured → ``()`` (nothing to show, like an
+    empty pool).  A configured credential whose fetch fails yields an
+    unavailable snapshot with the same failure isolation as the Codex pool
+    entries.
+    """
+    if not fresh:
+        cached = _pool_usage_cache_get("opencode-go", _OPENCODE_GO_ENV_CACHE_KEY)
+        if cached is not None:
+            return (replace(cached, active=True),)
+    try:
+        token, base_url = _resolve_opencode_go_usage_credentials(None, None)
+    except Exception:
+        # No OpenCode Go credential configured (e.g. OPENCODE_GO_API_KEY
+        # unset): nothing to show — exactly like an empty pool.
+        return ()
+    try:
+        snapshot = _fetch_opencode_go_account_usage_with_credentials(token, base_url)
+    except httpx.HTTPStatusError as exc:
+        snapshot = _unavailable_pool_snapshot(
+            "The stored OpenCode Go API key was rejected."
+            if exc.response.status_code in {401, 403}
+            else "The OpenCode Go usage service is temporarily unavailable.",
+            provider="opencode-go",
+        )
+    except Exception:
+        snapshot = _unavailable_pool_snapshot(
+            "The OpenCode Go usage service is temporarily unavailable.",
+            provider="opencode-go",
+        )
+    _pool_usage_cache_put("opencode-go", _OPENCODE_GO_ENV_CACHE_KEY, snapshot)
+    return (replace(snapshot, active=True),)
 
 
 def fetch_pool_account_usage(
@@ -1037,8 +1232,15 @@ def fetch_pool_account_usage(
     deliberately adds no polling or auth refresh of its own. Failure isolation
     is unchanged: a failing entry still yields an unavailable snapshot while
     the others report live numbers.
+
+    ``opencode-go`` is handled as a single env-backed account: it returns at
+    most one active snapshot resolved from ``OPENCODE_GO_API_KEY`` with NO
+    pool read, selection, refresh, persistence, or routing mutation. ``fresh``
+    and the 60s cache behave identically to the Codex entries.
     """
     normalized = str(provider or "").strip().lower()
+    if normalized == "opencode-go":
+        return _fetch_opencode_go_env_usage_snapshot(fresh=fresh)
     if normalized != "openai-codex":
         return ()
 
@@ -1113,6 +1315,247 @@ def fetch_pool_account_usage(
         )
         for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
     )
+
+
+# ── Aggregate (all-provider, explicit-command surface) ──────────────────────
+#
+# ``fetch_aggregate_account_usage`` is the read-only, all-provider surface for
+# explicit user commands (plugin /chatgpt-limits, /gptusage, CLI). It composes
+# the existing per-provider pool fetches and re-labels every snapshot with
+# SAFE display names: a persisted row's raw ``label`` is preserved ONLY when it
+# is a benign human-configured name (see ``is_safe_aggregate_account_label``);
+# anything email-shaped, env-var-shaped, token/JWT/UUID/hash-like, an internal
+# id, or otherwise non-benign falls back to a provider-prefixed ordinal
+# (``OpenAI-Codex-N`` / ``OpenCode-Go-N``). Account ids and tokens are never
+# placed on the snapshots' display fields and the serializer already refuses
+# to emit ``credential_id``.
+
+_AGGREGATE_PROVIDERS = ("openai-codex", "opencode-go")
+
+# Conservative display-name pattern: printable ASCII word chars only, 1..48
+# chars, first char alphanumeric. No ``@``, no control characters, no
+# non-ASCII, no leading whitespace, no punctuation outside `` ._()-``.
+_SAFE_AGGREGATE_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,47}$")
+# Env-var-shaped names (e.g. ``OPENCODE_GO_API_KEY``, ``MY_SECRET_TOKEN``).
+_ENV_VAR_LIKE_LABEL_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+# Digest/UUID-shaped: >= 32 chars of hex/dash only.
+_HEXISH_LABEL_PATTERN = re.compile(r"^[0-9a-fA-F-]{32,}$")
+# Common credential/token prefixes (lowercased comparisons). Defense-in-depth:
+# a raw label that starts with one of these is never a benign display name.
+_TOKEN_LIKE_LABEL_PREFIXES = (
+    "sk-",
+    "sk_",
+    "sk.",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "ya29.",
+    "eyj",
+    "ak-",
+    "rk-",
+    "akia",
+    "-----begin",
+)
+# Suffixes that make a name look like a credential variable, not a human label.
+_ENV_VAR_LIKE_LABEL_SUFFIXES = (
+    "_api_key",
+    "_token",
+    "_secret",
+    "_password",
+    "_key",
+    "_access_key",
+)
+# Whole-word credential names that are never benign display labels.
+_CREDENTIAL_WORD_LABELS = {
+    "bearer",
+    "token",
+    "secret",
+    "password",
+    "apikey",
+    "api_key",
+    "access_token",
+    "refresh_token",
+}
+
+
+def is_safe_aggregate_account_label(raw: Any) -> bool:
+    """True iff ``raw`` is a benign, display-safe account label.
+
+    The safe-label policy for the aggregate surface: preserve a raw persisted
+    label only when it is a plausible human-configured name — 1..48 chars,
+    printable ASCII word chars only (``[A-Za-z0-9][A-Za-z0-9 ._()-]*``), no
+    ``@`` (no emails), no control/non-ASCII characters, not env-var-shaped
+    (``*_API_KEY``, ``*_TOKEN``, …), not token/JWT/UUID/hash-shaped, and not a
+    bare credential word. Anything else must fall back to a provider ordinal.
+    Internal ids are rejected by the caller (``_aggregate_codex_row_labels``)
+    rather than here, because the id comparison needs the row's own id.
+    """
+    if not isinstance(raw, str):
+        return False
+    if not raw or len(raw) > 48:
+        return False
+    if not _SAFE_AGGREGATE_LABEL_PATTERN.fullmatch(raw):
+        return False
+    lowered = raw.lower()
+    if "@" in raw:  # belt-and-braces; the pattern already excludes '@'
+        return False
+    if lowered.startswith(_TOKEN_LIKE_LABEL_PREFIXES):
+        return False
+    if _ENV_VAR_LIKE_LABEL_PATTERN.fullmatch(raw):
+        return False
+    if lowered.endswith(_ENV_VAR_LIKE_LABEL_SUFFIXES):
+        return False
+    if lowered in _CREDENTIAL_WORD_LABELS:
+        return False
+    if _HEXISH_LABEL_PATTERN.fullmatch(raw):
+        return False
+    return True
+
+
+def _aggregate_display_label(raw: Any, *, provider: str, index: int, entry_id: Optional[str] = None) -> str:
+    """Return the safe display label for one aggregate account.
+
+    Preserves ``raw`` only when benign (and not the row's own internal id);
+    otherwise falls back to a provider-prefixed ordinal: ``OpenAI-Codex-N`` for
+    ``openai-codex``, ``OpenCode-Go-N`` for ``opencode-go``, else a title-cased
+    provider prefix. ``index`` is the 1-based position among that provider's
+    accounts in priority order.
+    """
+    if entry_id is not None and isinstance(raw, str) and raw == str(entry_id):
+        raw = None  # never emit an internal credential id as a display name
+    if is_safe_aggregate_account_label(raw):
+        return raw
+    prefix = {
+        "openai-codex": "OpenAI-Codex",
+        "opencode-go": "OpenCode-Go",
+    }.get(provider, str(provider or "account").title())
+    return f"{prefix}-{index}"
+
+
+def _aggregate_codex_row_labels() -> tuple[tuple[str, str], ...]:
+    """Map persisted Codex pool rows to SAFE display labels, in priority order.
+
+    Read-only: uses the same raw ``read_credential_pool`` read as
+    ``fetch_pool_account_usage`` — never ``load_pool``/``select``/``peek``, no
+    refresh, no persistence, no routing mutation. The returned pairs are
+    ``(entry_id, safe_label)``; ``entry_id`` is used only for internal
+    correlation and is never placed on a display field. Any read/parse failure
+    yields ``()`` and the aggregate falls back to pure ordinals.
+    """
+    try:
+        from agent.credential_pool import PooledCredential
+
+        raw_rows = read_credential_pool("openai-codex")
+        entries = [
+            PooledCredential.from_dict("openai-codex", row)
+            for row in raw_rows
+            if isinstance(row, dict)
+        ]
+    except Exception:
+        return ()
+    entries.sort(key=lambda entry: (int(entry.priority or 0), str(entry.id)))
+    return tuple(
+        (
+            str(entry.id),
+            _aggregate_display_label(
+                entry.label,
+                provider="openai-codex",
+                index=index,
+                entry_id=str(entry.id),
+            ),
+        )
+        for index, entry in enumerate(entries, start=1)
+    )
+
+
+def fetch_aggregate_account_usage(
+    *,
+    providers: tuple[str, ...] = _AGGREGATE_PROVIDERS,
+    fresh: bool = True,
+) -> tuple[AccountUsageSnapshot, ...]:
+    """Fetch usage for every configured account across the supported providers.
+
+    The explicit all-provider surface for user commands: composes
+    ``fetch_pool_account_usage`` for each provider in ``providers`` (deduped,
+    order-preserving) with per-provider failure isolation, and returns one
+    snapshot per account labeled for THIS surface only (safe display names —
+    see ``is_safe_aggregate_account_label``; benign configured labels are
+    preserved, everything else becomes ``OpenAI-Codex-N`` / ``OpenCode-Go-N``).
+
+    Read-only by construction: it never loads, selects, peeks, refreshes, or
+    persists any credential (the underlying pool fetch is itself side-effect
+    free), and account ids / tokens are never placed on display fields.
+
+    ``fresh=True`` (default) bypasses the per-entry 60s cache READS — every
+    account is fetched from the backend — while the fresh results are still
+    written back through the existing per-entry caches, so the gateway/status
+    path and later cached calls immediately see the new numbers. This is the
+    explicit-command contract: a user asking for limits gets live numbers, and
+    the shared cache stays warm.
+
+    Failure isolation mirrors the pool path: a provider that raises yields one
+    unavailable snapshot (with its provider's ordinal label) instead of
+    aborting the aggregate, and a failing entry inside the pool fetch already
+    yields its own unavailable snapshot. The Codex row→label mapping is
+    order/id based and degrades safely on unavailable rows or count mismatch
+    (pure ordinals). ``opencode-go`` snapshots are always labeled
+    ``OpenCode-Go-N`` — the env-backed account has no persisted label and the
+    env var name (``OPENCODE_GO_API_KEY``) must never surface.
+    """
+    normalized: list[str] = []
+    for raw in providers or ():
+        candidate = str(raw or "").strip().lower()
+        if candidate and candidate not in normalized:
+            normalized.append(candidate)
+    if not normalized:
+        return ()
+
+    codex_labels = _aggregate_codex_row_labels() if "openai-codex" in normalized else ()
+    labels_by_id = dict(codex_labels)
+
+    results: list[AccountUsageSnapshot] = []
+    for provider in normalized:
+        try:
+            snapshots = fetch_pool_account_usage(provider, fresh=fresh)
+        except Exception:
+            # Fixed safe message: never echo the exception text into the
+            # payload (it could embed internals). The failure is logged so a
+            # dead provider is diagnosable in agent.log.
+            logger.debug("aggregate ▸ %s pool fetch failed (fail-open)", provider, exc_info=True)
+            snapshots = (
+                _unavailable_pool_snapshot(
+                    "The account usage service is temporarily unavailable.", provider=provider
+                ),
+            )
+        if provider == "openai-codex":
+            for position, snapshot in enumerate(snapshots, start=1):
+                label = None
+                if snapshot.credential_id:
+                    label = labels_by_id.get(snapshot.credential_id)
+                if label is None and position - 1 < len(codex_labels):
+                    # Order-based fallback (e.g. pool changed between the two
+                    # raw reads, or the snapshot lacks an id).
+                    label = codex_labels[position - 1][1]
+                if label is None:
+                    label = _aggregate_display_label(None, provider="openai-codex", index=position)
+                results.append(replace(snapshot, account_label=label))
+        elif provider == "opencode-go":
+            for position, snapshot in enumerate(snapshots, start=1):
+                results.append(
+                    replace(
+                        snapshot,
+                        account_label=_aggregate_display_label(
+                            None, provider="opencode-go", index=position
+                        ),
+                    )
+                )
+        else:
+            results.extend(snapshots)
+    return tuple(results)
 
 
 def account_usage_snapshot_to_dict(snapshot: AccountUsageSnapshot) -> dict[str, Any]:

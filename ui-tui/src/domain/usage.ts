@@ -38,14 +38,18 @@ export function formatCodexUsage(accounts: CodexUsageAccount[] | undefined, cols
       const session = remaining(windowFor(account, 'session'))
       const weekly = remaining(windowFor(account, 'weekly'))
       const marker = accountMarker(account)
-      if (cols < 100) return `${marker} ${session ?? '?'}/${weekly ?? '?'}`
-      return `${marker} S${session ?? '?'} W${weekly ?? '?'}`
+      return `${marker} ${session ?? '?'}/${weekly ?? '?'}`
     })
-    .join(cols < 100 ? ' ' : ' │ ')
+    .join(' ')
 }
 
 export function codexUsageDetails(accounts: CodexUsageAccount[] | undefined): string[] {
-  return (accounts ?? []).flatMap((account, index) => {
+  // Only Codex pool accounts (or legacy accounts predating the provider field)
+  // belong in this panel — other providers (e.g. opencode-go) must never be
+  // rendered as a bogus "Codex N" entry. Mirror formatCodexUsage's filter so
+  // index stays a Codex ordinal after filtering.
+  const visible = (accounts ?? []).filter(account => account.provider === 'openai-codex' || !account.provider)
+  return visible.flatMap((account, index) => {
     const marker = accountMarker(account)
     const heading = `${marker} ${account.label || `Codex ${index + 1}`}${account.active ? ' (active)' : ''}`
     const lines = (account.windows ?? []).map(window => {
@@ -58,5 +62,43 @@ export function codexUsageDetails(accounts: CodexUsageAccount[] | undefined): st
     for (const detail of account.details ?? []) lines.push(`  ${detail}`)
     if (account.unavailable_reason) lines.push(`  Unavailable: ${account.unavailable_reason}`)
     return [heading, ...lines]
+  })
+}
+
+// ── OpenCode Go (single env-backed account, read-only) ──────────────────────
+
+const openCodeGoWindow = (account: CodexUsageAccount | undefined, kind: 'rolling' | 'weekly' | 'monthly') =>
+  (account?.windows ?? []).find(window => {
+    const label = String(window.label ?? '').toLowerCase()
+    return kind === 'rolling' ? label.includes('rolling') : label.includes(kind)
+  })
+
+/**
+ * Compact status segment for the env-backed OpenCode Go account:
+ * `Go <rolling>/<weekly>/<monthly>` remaining percentages, `?` per missing
+ * window. Never exposes account labels or credential-derived identifiers.
+ */
+export function formatOpenCodeGoUsage(accounts: CodexUsageAccount[] | undefined): string {
+  const visible = (accounts ?? []).filter(account => account.provider === 'opencode-go')
+  if (!visible.length) return ''
+  const go = visible[0]
+  const fmt = (value: number | null) => (value == null ? '?' : String(value))
+  return `Go ${fmt(remaining(openCodeGoWindow(go, 'rolling')))}/${fmt(remaining(openCodeGoWindow(go, 'weekly')))}/${fmt(remaining(openCodeGoWindow(go, 'monthly')))}`
+}
+
+/** Detailed /usage block: `OpenCode Go` heading + rolling/weekly/monthly lines. */
+export function openCodeGoUsageDetails(accounts: CodexUsageAccount[] | undefined): string[] {
+  return (accounts ?? []).flatMap(account => {
+    if (account.provider !== 'opencode-go') return []
+    const lines = (account.windows ?? []).map(window => {
+      const left = remaining(window)
+      const used =
+        typeof window.used_percent === 'number' ? Math.max(0, Math.min(100, Math.round(window.used_percent))) : null
+      const reset = window.reset_human ? ` · resets ${window.reset_human}` : window.detail ? ` · ${window.detail}` : ''
+      return `  ${window.label || 'Window'}: ${left == null ? 'unavailable' : `${left}% remaining (${used}% used)`}${reset}`
+    })
+    for (const detail of account.details ?? []) lines.push(`  ${detail}`)
+    if (account.unavailable_reason) lines.push(`  Unavailable: ${account.unavailable_reason}`)
+    return ['OpenCode Go', ...lines]
   })
 }

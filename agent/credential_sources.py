@@ -302,22 +302,32 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
     the removal would be instantly undone.  We suppress instead of
     deleting Codex CLI's file, so the Codex CLI itself keeps working.
 
-    The canonical source name in ``_seed_from_singletons`` is
-    ``"device_code"`` (no prefix).  Entries may show up in the pool as
-    either ``"device_code"`` (seeded) or ``"manual:device_code"`` (added
-    via ``hermes auth add openai-codex``), but in both cases the re-seed
-    gate lives at the ``"device_code"`` suppression key.  We suppress
-    that canonical key here; the central dispatcher also suppresses
-    ``removed.source`` which is fine — belt-and-suspenders, idempotent.
+    Source-aware removal: the canonical ``device_code`` source (seeded
+    from the Hermes auth store singleton) gets the full cleanup below.
+    ``manual:device_code`` rows are INDEPENDENT pool credentials added
+    via ``hermes auth add openai-codex`` (#39236): they carry their own
+    token, are never re-seeded from the singleton or ~/.codex/auth.json,
+    and must not clear the singleton that backs the canonical
+    ``device_code`` row — doing so would destroy the other credential
+    the user is keeping.  Removing a manual row is a no-op here:
+    ``pool.remove_index`` already removed the pool entry before
+    dispatch, and nothing external backs it.
     """
+    # Manual rows are pool-only and independent — no singleton to clear,
+    # no canonical source to suppress, no ~/.codex/auth.json to mention.
+    # suppress=False also stops the central dispatcher from writing a
+    # `manual:device_code` suppression marker, which nothing re-seeds.
+    if str(removed.source or "").startswith("manual:"):
+        return RemovalResult(suppress=False)
+
     from hermes_cli.auth import suppress_credential_source
 
     result = RemovalResult()
     if _clear_auth_store_provider(provider):
         result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
-    # Suppress the canonical re-seed source, not just whatever source the
-    # removed entry had.  Otherwise `manual:device_code` removals wouldn't
-    # block the `device_code` re-seed path.
+    # Suppress the canonical re-seed source so the singleton-backed
+    # `device_code` row can't come back on the next load_pool() before
+    # the user has decided to re-authenticate.
     suppress_credential_source(provider, "device_code")
     result.hints.extend([
         "Suppressed openai-codex device_code source — it will not be re-seeded.",

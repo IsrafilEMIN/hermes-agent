@@ -1,6 +1,67 @@
+import sys
 import threading
 import time
+import types
+import unittest
 from types import SimpleNamespace
+from unittest import mock
+
+# ── Offline harness: conditional third-party stubs ──────────────────────────
+# Injects minimal stand-ins ONLY when the real modules are not installed (CI
+# has them, so production import behavior is untouched there). Lets this file
+# run with plain ``python -m unittest`` in dep-less environments.
+def _install_stub_if_missing(name: str, attrs: dict) -> None:
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)
+        return
+    except ImportError:
+        pass
+    mod = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    sys.modules[name] = mod
+
+
+class _GatewayStubHTTPStatusError(Exception):
+    pass
+
+
+class _GatewayStubHTTPClient:
+    def __init__(self, *args, **kwargs):
+        self.timeout = kwargs.get("timeout")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def get(self, *args, **kwargs):
+        raise AssertionError("gateway payload tests must not perform real HTTP")
+
+
+_install_stub_if_missing(
+    "httpx",
+    {
+        "Client": _GatewayStubHTTPClient,
+        "HTTPStatusError": _GatewayStubHTTPStatusError,
+        "RequestError": type("RequestError", (Exception,), {}),
+    },
+)
+_install_stub_if_missing(
+    "yaml",
+    {
+        "load": lambda *_a, **_k: {},
+        "safe_load": lambda *_a, **_k: {},
+        "SafeLoader": object,
+        "SafeDumper": object,
+        "CSafeLoader": object,
+    },
+)
+_install_stub_if_missing("jiter", {})
+_install_stub_if_missing("dotenv", {"load_dotenv": lambda *_a, **_k: False})
 
 from agent import account_usage
 from tui_gateway import server
@@ -342,3 +403,167 @@ def test_settled_usage_refresh_scheduling_failure_is_fail_open(monkeypatch):
         assert server._settled_usage_refresh_generations.get("sid-nopool") is None
     finally:
         _unregister_session("sid-nopool")
+
+
+# ── OpenCode Go current-provider payload tests (unittest-based) ──────────────
+# The same gateway contract as the Codex pool tests, for the env-backed
+# opencode-go provider: safe payloads, cached/fresh forwarding, strict
+# provider gating (a Codex parent never fetches Go and vice versa), and
+# fail-open failures that never leak secrets or internal credential ids.
+
+
+def _go_snapshot(used_percent=22.0, *, credential_id="env-cred"):
+    return account_usage.AccountUsageSnapshot(
+        provider="opencode-go",
+        source="usage_api",
+        fetched_at=account_usage._utc_now(),
+        account_label="Go",
+        active=True,
+        credential_id=credential_id,
+        windows=(account_usage.AccountUsageWindow("Rolling 5h", used_percent=used_percent),),
+    )
+
+
+class OpenCodeGoUsagePayloadTests(unittest.TestCase):
+    """OpenCode Go current-provider behavior of ``_session_usage_snapshot``."""
+
+    @staticmethod
+    def _go_agent():
+        return SimpleNamespace(provider="opencode-go")
+
+    def _snapshot(self, agent, *, fresh=False, fetch, usage=None):
+        with mock.patch.object(
+            server, "_get_usage", lambda _agent: usage if usage is not None else {"calls": 1, "total": 10}
+        ), mock.patch.object(account_usage, "fetch_pool_account_usage", fetch):
+            return server._session_usage_snapshot({"agent": agent}, fresh=fresh)
+
+    def test_opencode_go_parent_emits_safe_accounts_payload(self):
+        seen = {}
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            seen.update(provider=provider, active_entry_id=active_entry_id, fresh=fresh)
+            return (_go_snapshot(),)
+
+        result = self._snapshot(self._go_agent(), fetch=fake_fetch)
+
+        self.assertEqual(seen, {"provider": "opencode-go", "active_entry_id": None, "fresh": False})
+        self.assertEqual(result["calls"], 1)
+        accounts = result["accounts"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["provider"], "opencode-go")
+        self.assertEqual(accounts[0]["label"], "Go")
+        self.assertTrue(accounts[0]["active"])
+        self.assertEqual(accounts[0]["windows"][0]["used_percent"], 22.0)
+        self.assertEqual(accounts[0]["windows"][0]["label"], "Rolling 5h")
+        # The internal credential id never reaches the wire; neither does any token.
+        rendered = repr(accounts)
+        self.assertNotIn("credential_id", rendered)
+        self.assertNotIn("env-cred", rendered)
+        self.assertNotIn("sk-", rendered)
+
+    def test_opencode_go_fresh_flag_reaches_pool_fetch(self):
+        seen = {}
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            seen.update(provider=provider, fresh=fresh)
+            return ()
+
+        result = self._snapshot(self._go_agent(), fresh=True, fetch=fake_fetch)
+        self.assertEqual(seen, {"provider": "opencode-go", "fresh": True})
+        self.assertNotIn("accounts", result)
+
+    def test_opencode_go_parent_never_fetches_codex(self):
+        calls = []
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            calls.append((provider, active_entry_id, fresh))
+            return ()
+
+        self._snapshot(self._go_agent(), fetch=fake_fetch)
+        self.assertEqual(calls, [("opencode-go", None, False)])
+        self.assertNotIn("openai-codex", [call[0] for call in calls])
+
+    def test_codex_parent_never_fetches_opencode_go(self):
+        agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="entry-b")
+        calls = []
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            calls.append((provider, active_entry_id, fresh))
+            return ()
+
+        self._snapshot(agent, fetch=fake_fetch)
+        self.assertEqual(calls, [("openai-codex", "entry-b", False)])
+        self.assertNotIn("opencode-go", [call[0] for call in calls])
+
+    def test_opencode_go_fetch_failure_is_fail_open_and_secret_free(self):
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("synthetic sk-secret-leak")
+
+        result = self._snapshot(
+            self._go_agent(),
+            fetch=boom,
+            usage={"calls": 2, "total": 20},
+        )
+        self.assertEqual(result, {"calls": 2, "total": 20})
+        self.assertNotIn("accounts", result)
+        self.assertNotIn("sk-secret-leak", repr(result))
+
+    def test_settled_opencode_go_emits_cached_then_schedules_fresh_refresh(self):
+        """End-of-turn: cached Go usage emits immediately; exactly one bounded
+        fresh Go refresh follows on the worker and lands secret-safe."""
+        agent = self._go_agent()
+        session = _register_session(
+            "sid-go", {"agent": agent, "session_key": "sess-go", "cwd": ""}
+        )
+        emitted = []
+        fetch_calls = []
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            fetch_calls.append((provider, active_entry_id, fresh))
+            if not fresh:
+                return ()  # cached emit: no accounts yet
+            fetch_started.set()
+            assert release_fetch.wait(timeout=5.0)
+            return (_go_snapshot(),)
+
+        with (
+            mock.patch.object(
+                server,
+                "_emit",
+                lambda ev, sid, payload=None: emitted.append((ev, sid, payload or {})),
+            ),
+            mock.patch.object(server, "_reconcile_session_cwd_from_terminal", lambda _s: False),
+            mock.patch.object(server, "_get_usage", lambda _agent: {"calls": 1, "total": 10}),
+            mock.patch.object(account_usage, "fetch_pool_account_usage", fake_fetch),
+        ):
+            try:
+                server._emit_settled_session_info("sid-go", session, agent)
+
+                # The cached emit lands while the fresh fetch is still blocked.
+                assert fetch_started.wait(timeout=5.0)
+                self.assertEqual([ev for ev, _sid, _p in emitted], ["session.info"])
+                event, sid, payload = emitted[0]
+                self.assertEqual((event, sid), ("session.info", "sid-go"))
+                self.assertEqual(payload["usage"]["calls"], 1)
+                self.assertNotIn("accounts", payload["usage"])
+
+                # The worker refreshes exactly once with fresh=True.
+                release_fetch.set()
+                self.assertTrue(_wait_until(lambda: len(emitted) == 2))
+                event, sid, payload = emitted[1]
+                self.assertEqual((event, sid), ("session.info", "sid-go"))
+                accounts = payload["usage"]["accounts"]
+                self.assertEqual(accounts[0]["label"], "Go")
+                self.assertEqual(accounts[0]["windows"][0]["used_percent"], 22.0)
+                rendered = repr(accounts)
+                self.assertNotIn("credential_id", rendered)
+                self.assertNotIn("env-cred", rendered)
+                self.assertEqual(
+                    fetch_calls,
+                    [("opencode-go", None, False), ("opencode-go", None, True)],
+                )
+            finally:
+                release_fetch.set()
+                _unregister_session("sid-go")

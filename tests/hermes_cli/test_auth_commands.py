@@ -522,29 +522,159 @@ def test_auth_remove_reindexes_priorities(tmp_path, monkeypatch):
 
 
 def test_auth_remove_codex_migrates_legacy_dict_suppression(tmp_path, monkeypatch):
-    """Removing a Codex credential must tolerate legacy dict suppression data."""
+    """Removing the canonical Codex device_code credential must tolerate
+    legacy dict suppression data (migrating it to list form) and stick."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    store = _codex_pool_only_store()
-    primary = store["credential_pool"]["openai-codex"][0]
-    primary.update({"id": "codex-qb", "label": "qb"})
-    store["suppressed_sources"] = {"openai-codex": {"legacy": True}}
+    store = {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": _jwt_with_email("codex@example.com"),
+                    "refresh_token": "refresh-token",
+                }
+            }
+        },
+        "credential_pool": {"openai-codex": []},
+        "suppressed_sources": {"openai-codex": {"legacy": True}},
+    }
     _write_auth_store(tmp_path, store)
 
     from hermes_cli.auth_commands import auth_remove_command
 
     class _Args:
         provider = "openai-codex"
-        target = "qb"
+        target = "1"
 
     auth_remove_command(_Args())
 
     payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     assert payload.get("credential_pool", {}).get("openai-codex", []) == []
-    assert payload["suppressed_sources"]["openai-codex"] == [
-        "legacy",
-        "device_code",
-        "manual:device_code",
-    ]
+    # Canonical device_code removal clears the singleton that backs the row.
+    assert "openai-codex" not in payload.get("providers", {})
+    # Legacy dict form was migrated to the canonical list form, and only the
+    # canonical `device_code` source is suppressed — not the manual variant.
+    assert payload["suppressed_sources"]["openai-codex"] == ["legacy", "device_code"]
+
+    from agent.credential_pool import load_pool
+
+    assert load_pool("openai-codex").peek() is None
+
+
+def test_auth_remove_manual_codex_row_preserves_singleton_auth(tmp_path, monkeypatch, capsys):
+    """Removing an independent manual:device_code row must remove ONLY the
+    pool row — it must not clear the provider singleton, suppress the
+    canonical device_code source, touch ~/.codex/auth.json, or print
+    misleading cleanup.
+
+    Regression: `auth remove` previously routed manual:device_code through
+    the canonical device_code removal, which cleared auth.json
+    providers.openai-codex (destroying the singleton-backed row's token)
+    and suppressed device_code so the surviving row never re-seeded.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    singleton_token = _jwt_with_email("codex@example.com")
+    store = {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": singleton_token,
+                    "refresh_token": "singleton-refresh",
+                }
+            }
+        },
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "codex-manual",
+                    "label": "manual-account",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:device_code",
+                    "access_token": _jwt_with_email("other@example.com"),
+                    "refresh_token": "manual-refresh",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                }
+            ]
+        },
+    }
+    _write_auth_store(tmp_path, store)
+
+    from hermes_cli.auth_commands import auth_remove_command
+
+    class _Args:
+        provider = "openai-codex"
+        target = "manual-account"
+
+    auth_remove_command(_Args())
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
+    # Only the manual row is gone; the singleton-backed device_code row
+    # survives with its own token intact.
+    remaining = payload["credential_pool"]["openai-codex"]
+    assert [entry["source"] for entry in remaining] == ["device_code"]
+    assert remaining[0]["access_token"] == singleton_token
+    # Singleton untouched — the token the user is keeping still exists.
+    assert payload["providers"]["openai-codex"]["tokens"]["access_token"] == singleton_token
+    # No suppression markers written for either source.
+    assert payload.get("suppressed_sources", {}).get("openai-codex") is None
+
+    # No misleading cleanup output: nothing was cleared, suppressed, or
+    # hinted about ~/.codex/auth.json.
+    out = capsys.readouterr().out
+    assert "Cleared openai-codex OAuth tokens" not in out
+    assert "Suppressed openai-codex device_code source" not in out
+    assert "~/.codex/auth.json" not in out
+
+    # A fresh load still re-seeds the surviving singleton-backed row
+    # (device_code is NOT suppressed) and keeps the manual row gone.
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    entries = pool.entries()
+    assert [entry.source for entry in entries] == ["device_code"]
+    assert entries[0].access_token == singleton_token
+
+
+def test_auth_remove_codex_device_code_row_clears_singleton_and_suppresses(tmp_path, monkeypatch, capsys):
+    """Removing the canonical device_code row keeps the existing cleanup:
+    singleton cleared, canonical source suppressed, Codex-CLI note shown."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    store = {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": _jwt_with_email("codex@example.com"),
+                    "refresh_token": "refresh-token",
+                }
+            }
+        },
+        "credential_pool": {"openai-codex": []},
+    }
+    _write_auth_store(tmp_path, store)
+
+    from hermes_cli.auth_commands import auth_remove_command
+
+    class _Args:
+        provider = "openai-codex"
+        target = "1"
+
+    auth_remove_command(_Args())
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
+    assert payload.get("credential_pool", {}).get("openai-codex", []) == []
+    assert "openai-codex" not in payload.get("providers", {})
+    assert payload["suppressed_sources"]["openai-codex"] == ["device_code"]
+
+    out = capsys.readouterr().out
+    assert "Cleared openai-codex OAuth tokens from auth store" in out
+    assert "Suppressed openai-codex device_code source" in out
+    assert "~/.codex/auth.json" in out
 
     from agent.credential_pool import load_pool
 
@@ -757,6 +887,84 @@ def test_credential_sources_find_step_copilot_before_generic_env(tmp_path, monke
     step = find_removal_step("xai", "env:XAI_API_KEY")
     assert step is not None
     assert "env-seeded" in step.description.lower()
+
+
+def test_credential_sources_codex_step_dispatches_both_sources():
+    """Both Codex pool sources — the canonical seeded `device_code` and the
+    independent `manual:device_code` row — must dispatch to the same
+    registered RemovalStep, which branches on the entry's source.
+    """
+    from agent.credential_sources import find_removal_step
+
+    canonical = find_removal_step("openai-codex", "device_code")
+    manual = find_removal_step("openai-codex", "manual:device_code")
+    assert canonical is not None
+    assert manual is canonical
+    # Other providers' device_code sources must NOT hit the Codex step.
+    assert find_removal_step("nous", "device_code") is not canonical
+    assert find_removal_step("xai-oauth", "device_code") is not canonical
+    assert find_removal_step("openai-codex", "manual") is None
+
+
+def test_remove_codex_manual_branch_is_pool_only_noop(monkeypatch):
+    """Synthetic branch test: removing a manual:device_code entry must
+    perform no external cleanup, write no suppression marker, and produce
+    no output — the pool row is already gone via pool.remove_index.
+    """
+    from types import SimpleNamespace
+
+    from agent.credential_sources import find_removal_step
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("manual removal must not touch external state")
+
+    # If the manual branch touches anything external, these guards fire.
+    monkeypatch.setattr(
+        "agent.credential_sources._clear_auth_store_provider", _must_not_be_called
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.suppress_credential_source", _must_not_be_called
+    )
+
+    step = find_removal_step("openai-codex", "manual:device_code")
+    assert step is not None
+    result = step.remove_fn("openai-codex", SimpleNamespace(source="manual:device_code"))
+
+    assert result.suppress is False
+    assert result.cleaned == []
+    assert result.hints == []
+
+
+def test_remove_codex_device_code_branch_cleans_and_suppresses(monkeypatch):
+    """Synthetic branch test: removing the canonical device_code entry
+    must keep the existing behavior — clear the provider singleton,
+    suppress the canonical device_code source, and report the
+    ~/.codex/auth.json note.
+    """
+    from types import SimpleNamespace
+
+    from agent.credential_sources import find_removal_step
+
+    cleared = []
+    suppressed = []
+    monkeypatch.setattr(
+        "agent.credential_sources._clear_auth_store_provider",
+        lambda provider: cleared.append(provider) or True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.suppress_credential_source",
+        lambda provider, source: suppressed.append((provider, source)),
+    )
+
+    step = find_removal_step("openai-codex", "device_code")
+    assert step is not None
+    result = step.remove_fn("openai-codex", SimpleNamespace(source="device_code"))
+
+    assert cleared == ["openai-codex"]
+    assert suppressed == [("openai-codex", "device_code")]
+    assert result.suppress is True
+    assert result.cleaned == ["Cleared openai-codex OAuth tokens from auth store"]
+    assert any("~/.codex/auth.json" in hint for hint in result.hints)
 
 
 def test_auth_remove_copilot_suppresses_all_variants(tmp_path, monkeypatch):

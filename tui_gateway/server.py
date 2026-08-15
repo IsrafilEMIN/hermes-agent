@@ -5277,7 +5277,12 @@ def _session_usage_snapshot(session: dict | None, *, fresh: bool = False) -> dic
         return dict(mirror_usage)
     if agent is not None:
         usage = dict(_get_usage(agent))
-        if str(getattr(agent, "provider", "") or "").strip().lower() == "openai-codex":
+        provider = str(getattr(agent, "provider", "") or "").strip().lower()
+        # Account snapshots from the session's provider(s) concatenate into
+        # one safe ``accounts`` list; each provider's fetch is independently
+        # fail-open so one outage never hides the other's numbers.
+        accounts: list[dict] = []
+        if provider == "openai-codex":
             try:
                 from agent.account_usage import (
                     account_usage_snapshot_to_dict,
@@ -5289,13 +5294,28 @@ def _session_usage_snapshot(session: dict | None, *, fresh: bool = False) -> dic
                     active_entry_id=getattr(agent, "_credential_pool_entry_id", None),
                     fresh=fresh,
                 )
-                if snapshots:
-                    usage["accounts"] = [
-                        account_usage_snapshot_to_dict(snapshot) for snapshot in snapshots
-                    ]
+                accounts.extend(
+                    account_usage_snapshot_to_dict(snapshot) for snapshot in snapshots
+                )
             except Exception:
                 # Cosmetic quota telemetry must never break session.info/usage.
                 logger.debug("pool account usage snapshot failed", exc_info=True)
+        if provider == "opencode-go":
+            try:
+                from agent.account_usage import (
+                    account_usage_snapshot_to_dict,
+                    fetch_pool_account_usage,
+                )
+
+                snapshots = fetch_pool_account_usage("opencode-go", fresh=fresh)
+                accounts.extend(
+                    account_usage_snapshot_to_dict(snapshot) for snapshot in snapshots
+                )
+            except Exception:
+                # Cosmetic quota telemetry must never break session.info/usage.
+                logger.debug("opencode-go account usage snapshot failed", exc_info=True)
+        if accounts:
+            usage["accounts"] = accounts
         return usage
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 

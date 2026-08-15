@@ -178,4 +178,103 @@ describe('/usage slash command', () => {
       cost_usd: 0.5
     })
   })
+
+  it('adds the OpenCode Go limits panel alongside Codex without clobbering state', async () => {
+    patchUiState(state => ({
+      ...state,
+      usage: {
+        ...state.usage,
+        active_subagents: 2,
+        compressions: 1,
+        context_max: 200_000,
+        context_percent: 25,
+        context_used: 50_000,
+        cost_usd: 0.5
+      }
+    }))
+    const { panel, run } = buildCtx({
+      'session.usage': baseUsage({
+        calls: 1,
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Codex 1',
+            provider: 'openai-codex',
+            windows: [{ label: 'Session', used_percent: 13, reset_human: 'in 2h' }]
+          },
+          {
+            active: true,
+            available: true,
+            label: 'Go 1',
+            provider: 'opencode-go',
+            windows: [
+              { label: 'Rolling 5h', used_percent: 10, reset_human: 'in 2h' },
+              { label: 'Weekly', used_percent: 41 },
+              { label: 'Monthly', used_percent: 47 }
+            ]
+          }
+        ]
+      })
+    })
+
+    await run('')
+
+    const codexSections = panel.mock.calls.find(c => c[0] === 'Codex limits')?.[1] as { text?: string }[]
+    const codexBody = (codexSections ?? []).map(s => s.text ?? '').join('\n')
+    expect(codexBody).toContain('● Codex 1 (active)')
+    // The Go account must never leak into the Codex panel as a bogus entry.
+    expect(codexBody).not.toContain('Go 1')
+
+    const goSections = panel.mock.calls.find(c => c[0] === 'OpenCode Go limits')?.[1] as { text?: string }[]
+    const goBody = (goSections ?? []).map(s => s.text ?? '').join('\n')
+    expect(goBody).toContain('OpenCode Go')
+    expect(goBody).toContain('  Rolling 5h: 90% remaining (10% used) · resets in 2h')
+    expect(goBody).toContain('  Weekly: 59% remaining (41% used)')
+    expect(goBody).toContain('  Monthly: 53% remaining (47% used)')
+    expect(goBody).not.toContain('Codex 1')
+
+    // Additive: both provider panels coexist exactly once, and the rpc response
+    // merges into (never replaces) pre-existing token-usage state.
+    expect(panel.mock.calls.filter(c => c[0] === 'Codex limits')).toHaveLength(1)
+    expect(panel.mock.calls.filter(c => c[0] === 'OpenCode Go limits')).toHaveLength(1)
+    expect(getUiState().usage).toMatchObject({
+      active_subagents: 2,
+      compressions: 1,
+      context_max: 200_000,
+      context_percent: 25,
+      context_used: 50_000,
+      cost_usd: 0.5,
+      calls: 1
+    })
+    expect(getUiState().usage.accounts?.filter(a => a.provider === 'opencode-go')).toHaveLength(1)
+  })
+
+  it('shows only the OpenCode Go limits panel for a Go-only payload (no Codex panel)', async () => {
+    const { panel, run } = buildCtx({
+      'session.usage': baseUsage({
+        accounts: [
+          {
+            active: true,
+            available: false,
+            label: 'Go 1',
+            provider: 'opencode-go',
+            unavailable_reason: 'The stored OpenCode Go API key was rejected.',
+            windows: []
+          }
+        ]
+      })
+    })
+
+    await run('')
+
+    const goSections = panel.mock.calls.find(c => c[0] === 'OpenCode Go limits')?.[1] as { text?: string }[]
+    expect((goSections ?? []).map(s => s.text ?? '').join('\n')).toContain(
+      'Unavailable: The stored OpenCode Go API key was rejected.'
+    )
+    // The gateway gates accounts to the current provider, so a Go-only payload
+    // must not fabricate a Codex limits panel — and the Go panel appears once.
+    expect(panel.mock.calls.filter(c => c[0] === 'Codex limits')).toHaveLength(0)
+    expect(panel.mock.calls.filter(c => c[0] === 'OpenCode Go limits')).toHaveLength(1)
+  })
 })
