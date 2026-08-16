@@ -358,7 +358,10 @@ class OpenCodeGoFetchParseTests(unittest.TestCase):
                 _TOKEN, "https://opencode.ai/zen/go"
             )
         client = _last_client()
-        self.assertEqual(client.timeout, 15.0)
+        # Quota telemetry is cosmetic: the transport gives up after 4s so a
+        # slow/unreachable usage endpoint can never stall the status bar (or
+        # the end-of-turn refresh) for a quarter of a minute.
+        self.assertEqual(client.timeout, 4.0)
         method, url, headers = client.requests[0]
         self.assertEqual(method, "GET")
         self.assertEqual(url, "https://opencode.ai/zen/go/v1/usage")
@@ -610,7 +613,7 @@ class OpenCodeGoSecretSafetyTests(unittest.TestCase):
         ):
             account_usage._clear_pool_account_usage_cache_for_tests()
             with _fake_http(_FakeHTTPResponse(LIVE_FIXTURE)):
-                snapshots = account_usage.fetch_pool_account_usage("opencode-go")
+                snapshots = account_usage.fetch_pool_account_usage("opencode-go", fresh=True)
         payloads = [account_usage.account_usage_snapshot_to_dict(item) for item in snapshots]
         rendered = repr(payloads)
         self.assertNotIn(_TOKEN, rendered)
@@ -681,7 +684,7 @@ class OpenCodeGoFetchPoolEnvPathTests(unittest.TestCase):
         ):
             with _fake_http(_FakeHTTPResponse(LIVE_FIXTURE)):
                 snapshots = account_usage.fetch_pool_account_usage(
-                    "opencode-go", active_entry_id="whatever"
+                    "opencode-go", active_entry_id="whatever", fresh=True
                 )
         self.assertEqual(len(snapshots), 1)
         self.assertTrue(snapshots[0].active)
@@ -705,7 +708,7 @@ class OpenCodeGoFetchPoolEnvPathTests(unittest.TestCase):
                     }
                 ),
             ):
-                first = account_usage.fetch_pool_account_usage("opencode-go")
+                first = account_usage.fetch_pool_account_usage("opencode-go", fresh=True)
                 cached = account_usage.fetch_pool_account_usage("opencode-go")
                 refreshed = account_usage.fetch_pool_account_usage("opencode-go", fresh=True)
                 after = account_usage.fetch_pool_account_usage("opencode-go")
@@ -719,7 +722,9 @@ class OpenCodeGoFetchPoolEnvPathTests(unittest.TestCase):
         for item in (first[0], cached[0], refreshed[0], after[0]):
             self.assertTrue(item.active)
 
-    def test_expired_cache_entry_is_refetched(self):
+    def test_expired_cache_entry_is_not_refetched_by_default(self):
+        """Cache-only contract: an EXPIRED cache entry yields nothing on a
+        fresh=False call (no network); only fresh=True refetches."""
         clock = {"now": 1000.0}
 
         def fake_monotonic():
@@ -730,9 +735,13 @@ class OpenCodeGoFetchPoolEnvPathTests(unittest.TestCase):
         ):
             with mock.patch.object(account_usage.time, "monotonic", fake_monotonic):
                 with _fake_http(_FakeHTTPResponse(LIVE_FIXTURE), _FakeHTTPResponse(LIVE_FIXTURE)):
-                    account_usage.fetch_pool_account_usage("opencode-go")  # cached at t=1000
+                    account_usage.fetch_pool_account_usage("opencode-go", fresh=True)  # fetch #1, cached at t=1000
                     clock["now"] = 1000.0 + account_usage._POOL_USAGE_CACHE_TTL_SECONDS + 1.0
-                    account_usage.fetch_pool_account_usage("opencode-go")  # expired → refetch
+                    # Expired + cache-only default: nothing, no network.
+                    self.assertEqual(
+                        account_usage.fetch_pool_account_usage("opencode-go"), ()
+                    )
+                    account_usage.fetch_pool_account_usage("opencode-go", fresh=True)  # fetch #2
         total_requests = sum(len(client.requests) for client in _FakeHTTPClient.instances)
         self.assertEqual(total_requests, 2)
 
@@ -882,8 +891,13 @@ class OpenCodeGoPoolRowsTests(unittest.TestCase):
         # read so hydration tests are deterministic.
         self.fake_pool_module.get_env_prefer_dotenv = os.environ.get
 
-    def _run(self, fetcher, *, active_entry_id=None, fresh=False, rows=None, clear_env=True):
+    def _run(self, fetcher, *, active_entry_id=None, fresh=True, rows=None, clear_env=True):
         """Run the pool fetch with stubbed rows + transport.
+
+        This class exercises the LIVE fetch path (pool rows, failures, fresh
+        semantics): fresh defaults True because the cache-only contract makes
+        fresh=False return nothing on a cold cache. Tests that specifically
+        probe cached reads pass fresh=False.
 
         ``clear_env=True`` (default) removes the OpenCode Go env vars so pool
         rows are exercised with env absent; fallback tests pass False to keep
@@ -1177,7 +1191,7 @@ class OpenCodeGoPoolRowsTests(unittest.TestCase):
         # Cached: a second enumeration (different active marking included)
         # makes NO new transport calls — the cache is keyed by entry id and
         # the active flag is re-applied per call.
-        snapshots = self._run(fetcher, active_entry_id="entry-a")
+        snapshots = self._run(fetcher, active_entry_id="entry-a", fresh=False)
         self.assertEqual(len(calls), 2)
         self.assertEqual([item.active for item in snapshots], [True, False])
 
@@ -1221,7 +1235,7 @@ class OpenCodeGoPoolRowsTests(unittest.TestCase):
         )
         # The fresh result replaced the cache: a later cached enumeration
         # makes no new calls and reports the new numbers.
-        after = self._run(fetcher)
+        after = self._run(fetcher, fresh=False)
         self.assertEqual(
             [item.windows[0].used_percent for item in after], [21.0, 64.0]
         )
@@ -1299,7 +1313,7 @@ class OpenCodeGoPoolRowsTests(unittest.TestCase):
                 {"OPENCODE_GO_API_KEY": _TOKEN, "OPENCODE_GO_BASE_URL": _CUSTOM_BASE},
             ),
         ):
-            snapshots = account_usage.fetch_pool_account_usage("opencode-go")
+            snapshots = account_usage.fetch_pool_account_usage("opencode-go", fresh=True)
         # A pool-read hiccup must never hide a configured env account.
         self.assertEqual(len(snapshots), 1)
         self.assertTrue(snapshots[0].active)
@@ -1347,10 +1361,163 @@ class OpenCodeGoPoolRowsTests(unittest.TestCase):
             os.environ.pop("OPENCODE_GO_API_KEY", None)
             os.environ.pop("OPENCODE_GO_BASE_URL", None)
             snapshots = account_usage.fetch_pool_account_usage(
-                "opencode-go", active_entry_id="entry-b"
+                "opencode-go", active_entry_id="entry-b", fresh=True
             )
         self.assertEqual(len(snapshots), 2)
         self.assertEqual([item.active for item in snapshots], [False, True])
+
+
+class OpenCodeGoPoolCacheOnlyTests(unittest.TestCase):
+    """Cache-only default (``fresh=False`` never fetches) for the Go pool.
+
+    A push emission (session.info) must never hit the network: a cold cache
+    yields nothing, a warm cache yields cached values, and cache-miss rows
+    are skipped while ordinal labels keep their position among ALL visible
+    rows (so numbering never shifts when a later fresh fetch fills the
+    gaps). ``fresh=True`` (the background refresh / explicit /usage) still
+    bypasses the cache and fetches.
+    """
+
+    def setUp(self):
+        account_usage._clear_pool_account_usage_cache_for_tests()
+        _FakeHTTPClient.instances.clear()
+        _FakeHTTPClient.response_queue = []
+        self.rows = [
+            {
+                "id": "entry-a",
+                "priority": 0,
+                "label": "person@example.com",
+                "access_token": "synthetic-token-a",
+                "base_url": "https://go-a.example.com/v1",
+            },
+            {
+                "id": "entry-b",
+                "priority": 1,
+                "label": "OPENCODE_GO_API_KEY",
+                "access_token": "synthetic-token-b",
+                "base_url": "",
+            },
+        ]
+        self.fake_pool_module = types.ModuleType("agent.credential_pool")
+        self.fake_pool_module.PooledCredential = _FakePooledCredential
+
+    def _run(self, fetcher, *, active_entry_id=None, fresh=False, rows=None, clear_env=True):
+        with (
+            mock.patch.dict(sys.modules, {"agent.credential_pool": self.fake_pool_module}),
+            mock.patch.object(
+                account_usage,
+                "read_credential_pool",
+                return_value=self.rows if rows is None else rows,
+            ),
+            mock.patch.object(
+                account_usage,
+                "_fetch_opencode_go_account_usage_with_credentials",
+                side_effect=fetcher,
+            ),
+            mock.patch.dict(os.environ),
+        ):
+            if clear_env:
+                os.environ.pop("OPENCODE_GO_API_KEY", None)
+                os.environ.pop("OPENCODE_GO_BASE_URL", None)
+            return account_usage.fetch_pool_account_usage(
+                "opencode-go",
+                active_entry_id=active_entry_id,
+                fresh=fresh,
+            )
+
+    @staticmethod
+    def _snapshot(*, used=22.0):
+        return account_usage.AccountUsageSnapshot(
+            provider="opencode-go",
+            source="usage_api",
+            fetched_at=account_usage._utc_now(),
+            windows=(account_usage.AccountUsageWindow("Rolling 5h", used_percent=used),),
+        )
+
+    def test_default_cold_cache_fetches_nothing(self):
+        def boom(*_args, **_kwargs):
+            self.fail("cache-only default must never perform a fetch")
+
+        self.assertEqual(self._run(boom), ())
+
+    def test_default_warm_cache_served_without_fetch(self):
+        calls = []
+
+        def fetcher(token, _base_url):
+            calls.append(token)
+            return self._snapshot(used=float(len(token)))
+
+        warmed = self._run(fetcher, fresh=True)
+        self.assertEqual(len(calls), 2)
+        calls.clear()
+
+        served = self._run(lambda *_a, **_k: self.fail("must not fetch"))
+        self.assertEqual([s.credential_id for s in served], ["entry-a", "entry-b"])
+        self.assertEqual(
+            [s.windows[0].used_percent for s in served],
+            [s.windows[0].used_percent for s in warmed],
+        )
+        self.assertEqual(calls, [])
+
+    def test_fresh_still_fetches_with_warm_cache(self):
+        calls = []
+
+        def fetcher(token, _base_url):
+            calls.append(token)
+            return self._snapshot(used=float(len(token)))
+
+        self._run(fetcher)  # warm the cache
+        calls.clear()
+
+        served = self._run(fetcher, fresh=True)
+        self.assertEqual(len(calls), 2, "fresh=True must bypass the cache and fetch")
+        self.assertEqual([s.credential_id for s in served], ["entry-a", "entry-b"])
+
+    def test_default_skips_missing_rows_keeps_ordinals(self):
+        def fetcher(token, _base_url):
+            return self._snapshot(used=float(len(token)))
+
+        # Warm ONLY entry-a (its row alone), then enumerate the FULL pool
+        # with the cache-only default: entry-b is a cache miss and must be
+        # skipped, and the surviving ordinal keeps its position among ALL
+        # visible rows.
+        warmed = self._run(fetcher, fresh=True, rows=[self.rows[0]])
+        self.assertEqual([s.credential_id for s in warmed], ["entry-a"])
+
+        served = self._run(
+            lambda *_a, **_k: self.fail("must not fetch on miss"),
+        )
+        self.assertEqual([s.credential_id for s in served], ["entry-a"])
+        self.assertEqual([s.account_label for s in served], ["OpenCode Go 1"])
+
+    def test_env_fallback_default_cold_returns_empty(self):
+        def boom(*_args, **_kwargs):
+            self.fail("cache-only env fallback must never fetch")
+
+        with mock.patch.dict(
+            os.environ, {"OPENCODE_GO_API_KEY": _TOKEN, "OPENCODE_GO_BASE_URL": _CUSTOM_BASE}
+        ):
+            result = self._run(boom, rows=[], clear_env=False)
+        self.assertEqual(result, ())
+
+    def test_env_fallback_default_warm_serves_cache(self):
+        def fetcher(token, _base_url):
+            return self._snapshot(used=33.0)
+
+        with mock.patch.dict(
+            os.environ, {"OPENCODE_GO_API_KEY": _TOKEN, "OPENCODE_GO_BASE_URL": _CUSTOM_BASE}
+        ):
+            warmed = self._run(fetcher, fresh=True, rows=[], clear_env=False)
+            self.assertEqual(len(warmed), 1)
+
+            served = self._run(
+                lambda *_a, **_k: self.fail("must not fetch"),
+                rows=[],
+                clear_env=False,
+            )
+        self.assertEqual(len(served), 1)
+        self.assertEqual(served[0].windows[0].used_percent, 33.0)
+        self.assertTrue(served[0].active)
 
 
 if __name__ == "__main__":

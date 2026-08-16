@@ -2337,6 +2337,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # was built without those tools. Catch up once they land — see
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
+            # Warm the quota cache off the build thread: the first
+            # session.info went out cache-only (by contract, never blocking
+            # session open), so the bar's quota segment fills in as soon as
+            # the fresh fetch lands. The emitted accounts ride along as the
+            # worker's comparison baseline.
+            _schedule_settled_usage_refresh(
+                sid, current, agent, baseline=(info.get("usage") or {}).get("accounts")
+            )
         except Exception as e:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
@@ -2734,14 +2742,23 @@ def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
     queued prompt's next turn is not delayed — and exactly one bounded
     background fresh pooled-Codex refresh is scheduled for the turn (see
     ``_schedule_settled_usage_refresh``); that worker's completion emits the
-    updated ``session.info`` carrying the fresh numbers.
+    updated ``session.info`` carrying the fresh numbers (skipped entirely
+    when the quota did not actually change — see ``_run_settled_usage_refresh``).
     """
     try:
         _reconcile_session_cwd_from_terminal(session)
     except Exception:
         logger.debug("failed to reconcile settled session cwd", exc_info=True)
-    _emit("session.info", sid, _session_info(agent, session))
-    _schedule_settled_usage_refresh(sid, session, agent)
+    # Cache-only usage by contract: a cold quota cache must never stall the
+    # turn loop on an HTTP fetch (the background refresh below owns live
+    # fetches). The emitted accounts ride along as the refresh's comparison
+    # baseline, so it can skip its redundant emit when the quota did not
+    # change.
+    info = _session_info(agent, session)
+    _emit("session.info", sid, info)
+    _schedule_settled_usage_refresh(
+        sid, session, agent, baseline=(info.get("usage") or {}).get("accounts")
+    )
 
 
 # End-of-turn usage refresh bookkeeping. Exactly one bounded background fresh
@@ -2755,7 +2772,9 @@ _settled_usage_refresh_lock = threading.Lock()
 _settled_usage_refresh_counter = itertools.count(1)
 
 
-def _schedule_settled_usage_refresh(sid: str, session: dict, agent) -> None:
+def _schedule_settled_usage_refresh(
+    sid: str, session: dict, agent, baseline=None
+) -> None:
     """Schedule the one bounded background fresh pool-usage fetch for this turn.
 
     Every settled turn schedules exactly one refresh (one call per end-of-turn
@@ -2765,12 +2784,16 @@ def _schedule_settled_usage_refresh(sid: str, session: dict, agent) -> None:
     ``fresh=True`` (no Nous fetch, no auth mutation, no polling). Fail-open: if
     the executor rejects the task (e.g. gateway shutdown) the refresh is
     dropped and the cached numbers already emitted stand.
+
+    ``baseline`` is the serialized ``accounts`` list the triggering emit
+    already carried; the worker compares the fresh quota against it and skips
+    its own emit when nothing changed (see ``_run_settled_usage_refresh``).
     """
     generation = next(_settled_usage_refresh_counter)
     with _settled_usage_refresh_lock:
         _settled_usage_refresh_generations[sid] = generation
     try:
-        _pool.submit(_run_settled_usage_refresh, sid, session, agent, generation)
+        _pool.submit(_run_settled_usage_refresh, sid, session, agent, generation, baseline)
     except Exception:
         with _settled_usage_refresh_lock:
             if _settled_usage_refresh_generations.get(sid) == generation:
@@ -2778,7 +2801,26 @@ def _schedule_settled_usage_refresh(sid: str, session: dict, agent) -> None:
         logger.debug("settled usage refresh scheduling failed", exc_info=True)
 
 
-def _run_settled_usage_refresh(sid: str, session: dict, agent, generation: int) -> None:
+def _usage_accounts_sig(accounts):
+    """Quota-change signature for the skip-emit comparison.
+
+    Strips ``fetched_at`` from every account dict: a cached snapshot and a
+    fresh one for the SAME quota always differ in fetch timestamp, so the
+    raw serialized lists would never compare equal and the skip would never
+    fire. Everything else (windows, percents, active marker, labels,
+    availability) is the quota the bar actually renders.
+    """
+    if not isinstance(accounts, list):
+        return accounts
+    return [
+        {key: value for key, value in account.items() if key != "fetched_at"}
+        for account in accounts
+    ]
+
+
+def _run_settled_usage_refresh(
+    sid: str, session: dict, agent, generation: int, baseline=None
+) -> None:
     """Background worker: fetch fresh pooled usage and re-emit ``session.info``.
 
     Runs on the bounded ``_pool`` executor. Failure is fail-open: the turn's
@@ -2788,7 +2830,10 @@ def _run_settled_usage_refresh(sid: str, session: dict, agent, generation: int) 
     suppressed when the refresh is stale — a newer settled turn scheduled its
     own refresh, or the session/agent are no longer the live ones — so
     out-of-order completions can never overwrite newer session state or
-    account data.
+    account data. The emit is ALSO suppressed when the fresh quota equals the
+    ``baseline`` the triggering emit already carried: the client's bar is
+    already correct, so the full ``session.info`` payload (system prompt,
+    tools, skills, MCP status) is not re-shipped for nothing.
     """
     try:
         try:
@@ -2797,6 +2842,12 @@ def _run_settled_usage_refresh(sid: str, session: dict, agent, generation: int) 
             logger.debug("settled usage refresh fetch failed", exc_info=True)
             return
         if _settled_usage_refresh_is_stale(sid, session, agent, generation):
+            return
+        if _usage_accounts_sig(usage.get("accounts")) == _usage_accounts_sig(baseline):
+            # Quota unchanged (or absent on both sides): the triggering emit
+            # already carries these numbers — skip the redundant emit. The
+            # fresh write-through cache still serves the values to every
+            # later cached emission.
             return
         try:
             _emit("session.info", sid, _session_info(agent, session, usage=usage))
@@ -4789,11 +4840,24 @@ def _apply_model_switch(
         _append_model_switch_marker(
             session, model=result.new_model, provider=result.target_provider
         )
-        _emit("session.info", sid, _session_info(agent, session))
+        info = _session_info(agent, session)
+        _emit("session.info", sid, info)
         if one_turn:
             session["one_turn_model_restore"] = restore_snapshot
         else:
             session.pop("one_turn_model_restore", None)
+            # The switch emit is cache-only: the NEW provider's quota may
+            # never have been fetched in this process (cold pool cache), so
+            # the quota segment would stay blank until the next settled
+            # turn. Warm it off-thread — same bounded machinery as session
+            # open/reset — so the new provider's numbers land within the
+            # fetch budget instead of blocking the switch (or never).
+            _schedule_settled_usage_refresh(
+                sid,
+                session,
+                agent,
+                baseline=(info.get("usage") or {}).get("accounts"),
+            )
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
@@ -5463,6 +5527,10 @@ def _session_info(
         # ``usage`` lets a caller inject an already-fetched snapshot (the
         # end-of-turn background refresh passes what it just fetched, so the
         # completion emit performs exactly one fresh fetch, not two).
+        # Push emissions are cache-only by contract (see
+        # ``_session_usage_snapshot``): a cold quota cache yields
+        # counters-without-accounts instead of a blocking HTTP fetch — live
+        # fetches belong to the background refresh worker alone.
         "usage": (
             usage if usage is not None else _session_usage_snapshot(session, fresh=fresh_usage)
         ),
@@ -7014,8 +7082,16 @@ def _init_session(
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
     _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
-    _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
+    session = _sessions.get(sid, {})
+    info = _session_info(agent, session)
+    _emit("session.info", sid, info)
     _schedule_mcp_late_refresh(sid, agent)
+    # Warm the quota cache off-thread (same machinery as the end-of-turn
+    # refresh): the cache-only emit above must not stall the reset path on an
+    # HTTP fetch, and the bar's quota segment fills in when the fetch lands.
+    _schedule_settled_usage_refresh(
+        sid, session, agent, baseline=(info.get("usage") or {}).get("accounts")
+    )
 
 
 def _new_session_key() -> str:

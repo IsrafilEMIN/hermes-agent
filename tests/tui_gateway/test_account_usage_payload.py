@@ -66,6 +66,21 @@ _install_stub_if_missing("dotenv", {"load_dotenv": lambda *_a, **_k: False})
 from agent import account_usage
 from tui_gateway import server
 
+# hermes_cli.model_switch drags in agent.models_dev → requests (absent in
+# dep-less sandboxes); stub it so _apply_model_switch's in-function import
+# resolves offline. On host/CI the real module loads (stub skipped) and the
+# tests run against the genuine parser/switch code.
+_install_stub_if_missing(
+    "hermes_cli.model_switch",
+    {
+        "parse_model_switch_args": lambda *_a, **_k: None,
+        "resolve_persist_behavior": lambda *_a, **_k: True,
+        "switch_model": lambda **_k: None,
+        "MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL": "once-with-global",
+        "MODEL_SWITCH_ERROR_TEXT": {},
+    },
+)
+
 
 def _codex_agent():
     return SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="entry-b")
@@ -242,7 +257,8 @@ def test_settled_session_info_emits_cached_then_schedules_background_refresh(mon
         assert "accounts" not in payload["usage"]
 
         # The worker refreshes exactly once, with fresh=True, for the pooled
-        # Codex account; the immediate cached emit used fresh=False.
+        # Codex account; the immediate cached emit used fresh=False (push
+        # emissions are cache-only, so the emit itself never fetches).
         release_fetch.set()
         assert _wait_until(lambda: len(emitted) == 2)
         event, sid, payload = emitted[1]
@@ -586,6 +602,234 @@ class OpenCodeGoUsagePayloadTests(unittest.TestCase):
             finally:
                 release_fetch.set()
                 _unregister_session("sid-go")
+
+    def test_settled_emit_passes_emitted_accounts_as_refresh_baseline(self):
+        """The settled emit runs cache-only (no fetch on cold cache) and hands
+        the accounts it carried to the refresh worker as its comparison
+        baseline, so the worker can skip its redundant emit when the quota
+        did not change — no session-dict recording involved."""
+        agent = self._go_agent()
+        session = _register_session(
+            "sid-record", {"agent": agent, "session_key": "sess-record", "cwd": ""}
+        )
+        scheduled = {}
+        try:
+            with (
+                mock.patch.object(server, "_emit", lambda *_a, **_k: None),
+                mock.patch.object(server, "_reconcile_session_cwd_from_terminal", lambda _s: False),
+                mock.patch.object(server, "_get_usage", lambda _agent: {"calls": 1, "total": 10}),
+                mock.patch.object(
+                    server,
+                    "_schedule_settled_usage_refresh",
+                    lambda sid, sess, agent, baseline=None: scheduled.update(
+                        sid=sid, baseline=baseline
+                    ),
+                ),
+                mock.patch.object(
+                    account_usage,
+                    "fetch_pool_account_usage",
+                    lambda provider, *, active_entry_id=None, fresh=False: (
+                        (_go_snapshot(),) if not fresh else ()
+                    ),
+                ),
+            ):
+                server._emit_settled_session_info("sid-record", session, agent)
+            self.assertEqual(scheduled["sid"], "sid-record")
+            self.assertEqual(scheduled["baseline"][0]["windows"][0]["used_percent"], 22.0)
+            self.assertEqual(scheduled["baseline"][0]["label"], "Go")
+            # The comparison baseline rides the schedule; nothing is recorded
+            # on the session dict itself.
+            self.assertNotIn("_settled_usage_accounts", session)
+        finally:
+            _unregister_session("sid-record")
+
+    def test_refresh_skips_emit_when_quota_unchanged(self):
+        """Fix C: the background refresh does not re-ship the full
+        session.info payload when the fresh quota equals the baseline the
+        triggering emit carried (fetch timestamps aside)."""
+        agent = self._go_agent()
+        session = _register_session(
+            "sid-skip", {"agent": agent, "session_key": "sess-skip", "cwd": ""}
+        )
+        emitted = []
+        baseline = [
+            dict(account_usage.account_usage_snapshot_to_dict(_go_snapshot()), fetched_at="t0")
+        ]
+        try:
+            with (
+                mock.patch.object(server, "_emit", lambda ev, sid, payload=None: emitted.append(ev)),
+                mock.patch.object(server, "_settled_usage_refresh_is_stale", lambda *_a, **_k: False),
+                mock.patch.object(
+                    server,
+                    "_session_usage_snapshot",
+                    lambda *_a, **_k: {
+                        "calls": 1,
+                        "accounts": [
+                            dict(account_usage.account_usage_snapshot_to_dict(_go_snapshot()), fetched_at="t1")
+                        ],
+                    },
+                ),
+            ):
+                server._run_settled_usage_refresh("sid-skip", session, agent, 1, baseline)
+            self.assertEqual(emitted, [])
+            self.assertNotIn("_settled_usage_accounts", session)
+        finally:
+            _unregister_session("sid-skip")
+
+    def test_refresh_emits_when_quota_changed(self):
+        agent = self._go_agent()
+        session = _register_session(
+            "sid-changed", {"agent": agent, "session_key": "sess-changed", "cwd": ""}
+        )
+        emitted = []
+        baseline = [account_usage.account_usage_snapshot_to_dict(_go_snapshot(22.0))]
+        try:
+            with (
+                mock.patch.object(server, "_emit", lambda ev, sid, payload=None: emitted.append(ev)),
+                mock.patch.object(server, "_settled_usage_refresh_is_stale", lambda *_a, **_k: False),
+                mock.patch.object(
+                    server,
+                    "_session_usage_snapshot",
+                    lambda *_a, **_k: {
+                        "calls": 1,
+                        "accounts": [
+                            account_usage.account_usage_snapshot_to_dict(_go_snapshot(88.0))
+                        ],
+                    },
+                ),
+            ):
+                server._run_settled_usage_refresh("sid-changed", session, agent, 1, baseline)
+            self.assertEqual(emitted, ["session.info"])
+            self.assertNotIn("_settled_usage_accounts", session)
+        finally:
+            _unregister_session("sid-changed")
+
+
+    def test_model_switch_schedules_usage_warm_refresh(self):
+        """Persistent /model switch: the cache-only switch emit schedules the
+        bounded quota warm refresh for the NEW provider. In a fresh process
+        the new provider's pool cache is cold — without the refresh the quota
+        segment stays blank until the next settled turn (the user-visible
+        gap: switching back to chatgpt-codex loses the GPT read-out)."""
+        agent = SimpleNamespace(
+            provider="opencode-go",
+            model="deepseek-v4-flash",
+            base_url="",
+            api_key="",
+            switch_model=lambda **kw: None,
+        )
+        session = _register_session(
+            "sid-switch", {"agent": agent, "session_key": "sess-switch", "cwd": ""}
+        )
+        scheduled = []
+        emitted = []
+        flags = SimpleNamespace(
+            model_input="gpt-5.6-sol",
+            explicit_provider="chatgpt-codex",
+            is_global=False,
+            is_session=False,
+            is_once=False,
+            is_force_refresh=False,
+        )
+        result = SimpleNamespace(
+            success=True,
+            new_model="gpt-5.6-sol",
+            target_provider="chatgpt-codex",
+            api_key=None,
+            base_url=None,
+            api_mode=None,
+            model_info=None,
+            warning_message="",
+        )
+        try:
+            with (
+                mock.patch.object(server, "_restart_slash_worker", lambda *_a, **_k: None),
+                mock.patch.object(server, "_persist_live_session_runtime", lambda *_a, **_k: None),
+                mock.patch.object(
+                    server, "_persist_live_session_system_prompt", lambda *_a, **_k: None
+                ),
+                mock.patch.object(server, "_append_model_switch_marker", lambda *_a, **_k: None),
+                mock.patch.object(server, "_persist_model_switch", lambda *_a, **_k: None),
+                mock.patch.object(
+                    server, "_emit", lambda ev, sid, payload=None: emitted.append(ev)
+                ),
+                mock.patch.object(server, "_get_usage", lambda _a: {"calls": 1, "total": 10}),
+                mock.patch.object(
+                    server,
+                    "_schedule_settled_usage_refresh",
+                    lambda sid, sess, agent, baseline=None: scheduled.append(baseline),
+                ),
+                mock.patch("hermes_cli.model_switch.switch_model", return_value=result),
+            ):
+                response = server._apply_model_switch(
+                    "sid-switch", session, "gpt-5.6-sol", parsed_flags=flags
+                )
+            self.assertEqual(response["value"], "gpt-5.6-sol")
+            self.assertEqual(emitted, ["session.info"])
+            # Exactly one warm refresh scheduled, carrying the cache-only
+            # emit's accounts as its comparison baseline (cold cache → None).
+            self.assertEqual(len(scheduled), 1)
+            self.assertIsNone(scheduled[0])
+            self.assertEqual(session["model_override"]["provider"], "chatgpt-codex")
+        finally:
+            _unregister_session("sid-switch")
+
+    def test_one_turn_switch_does_not_schedule_warm_refresh(self):
+        """``/model --once`` is temporary by design: no quota warm refresh
+        (the session reverts providers after the turn)."""
+        agent = SimpleNamespace(
+            provider="opencode-go",
+            model="deepseek-v4-flash",
+            base_url="",
+            api_key="",
+            switch_model=lambda **kw: None,
+        )
+        session = _register_session(
+            "sid-once", {"agent": agent, "session_key": "sess-once", "cwd": ""}
+        )
+        scheduled = []
+        flags = SimpleNamespace(
+            model_input="gpt-5.6-sol",
+            explicit_provider="chatgpt-codex",
+            is_global=False,
+            is_session=False,
+            is_once=True,
+            is_force_refresh=False,
+        )
+        result = SimpleNamespace(
+            success=True,
+            new_model="gpt-5.6-sol",
+            target_provider="chatgpt-codex",
+            api_key=None,
+            base_url=None,
+            api_mode=None,
+            model_info=None,
+            warning_message="",
+        )
+        try:
+            with (
+                mock.patch.object(server, "_restart_slash_worker", lambda *_a, **_k: None),
+                mock.patch.object(server, "_persist_live_session_runtime", lambda *_a, **_k: None),
+                mock.patch.object(
+                    server, "_persist_live_session_system_prompt", lambda *_a, **_k: None
+                ),
+                mock.patch.object(server, "_append_model_switch_marker", lambda *_a, **_k: None),
+                mock.patch.object(server, "_persist_model_switch", lambda *_a, **_k: None),
+                mock.patch.object(server, "_snapshot_agent_model_runtime", lambda *_a: {}),
+                mock.patch.object(server, "_emit", lambda *_a, **_k: None),
+                mock.patch.object(server, "_get_usage", lambda _a: {"calls": 1, "total": 10}),
+                mock.patch.object(
+                    server,
+                    "_schedule_settled_usage_refresh",
+                    lambda sid, sess, agent, baseline=None: scheduled.append(baseline),
+                ),
+                mock.patch("hermes_cli.model_switch.switch_model", return_value=result),
+            ):
+                server._apply_model_switch("sid-once", session, "gpt-5.6-sol", parsed_flags=flags)
+            self.assertEqual(scheduled, [])
+            self.assertNotIn("model_override", session)
+        finally:
+            _unregister_session("sid-once")
 
 
 # ── Explicit /usage aggregation (session.usage RPC) ─────────────────────────

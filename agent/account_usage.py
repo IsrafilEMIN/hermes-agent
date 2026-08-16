@@ -569,7 +569,7 @@ def _fetch_codex_account_usage_with_credentials(
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=_USAGE_FETCH_TIMEOUT_SECONDS) as client:
         response = client.get(_resolve_codex_usage_url(base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -1044,7 +1044,7 @@ def _fetch_opencode_go_account_usage_with_credentials(
         "User-Agent": "hermes",
     }
     normalized = _canonical_opencode_go_base_url(base_url)
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=_USAGE_FETCH_TIMEOUT_SECONDS) as client:
         response = client.get(f"{normalized}/usage", headers=headers)
         response.raise_for_status()
     try:
@@ -1118,6 +1118,11 @@ def fetch_account_usage(
 
 
 _POOL_USAGE_CACHE_TTL_SECONDS = 60.0
+# Budget for status-bar quota GETs: quota telemetry is cosmetic, so a slow or
+# unreachable usage endpoint gives up after 4s instead of stalling the
+# end-of-turn refresh (or a user-initiated /usage read). Slower endpoints
+# still work — they just fail open.
+_USAGE_FETCH_TIMEOUT_SECONDS = 4.0
 _POOL_USAGE_CACHE: dict[tuple[str, str], tuple[float, AccountUsageSnapshot]] = {}
 _POOL_USAGE_CACHE_LOCK = threading.Lock()
 
@@ -1189,11 +1194,16 @@ def _fetch_opencode_go_env_usage_snapshot(*, fresh: bool) -> tuple[AccountUsageS
     empty pool).  A configured credential whose fetch fails yields an
     unavailable snapshot with the same failure isolation as the Codex pool
     entries.
+
+    Cache-only contract: ``fresh=False`` (push emissions) returns the cached
+    snapshot or nothing — never hits the network. Live fetches belong to the
+    ``fresh=True`` caller (the background refresh worker / explicit /usage).
     """
     if not fresh:
         cached = _pool_usage_cache_get("opencode-go", _OPENCODE_GO_ENV_CACHE_KEY)
         if cached is not None:
             return (replace(cached, active=True),)
+        return ()
     try:
         token, base_url = _resolve_opencode_go_usage_credentials(None, None)
     except Exception:
@@ -1282,6 +1292,12 @@ def _fetch_opencode_go_pool_usage_snapshots(
     row.  Labels are safe ordinals (``OpenCode Go N``) — raw row labels,
     ids, and tokens are never placed on display fields.
 
+    Cache-only contract: ``fresh=False`` (push emissions) returns cached
+    entries only — cache misses are skipped entirely (no network), and
+    ordinal labels keep their position among ALL visible rows so numbering
+    stays stable when a later fresh fetch fills the gaps. Live fetches
+    belong to the ``fresh=True`` caller alone.
+
     Compatibility fallback: when NO pool rows are visible (classic env-only
     setup, or the pool read itself fails), delegates to
     ``_fetch_opencode_go_env_usage_snapshot`` so env-only setups keep the
@@ -1321,11 +1337,12 @@ def _fetch_opencode_go_pool_usage_snapshots(
             entries[0].id,
         )
 
-    def fetch_entry(entry) -> AccountUsageSnapshot:
+    def fetch_entry(entry) -> Optional[AccountUsageSnapshot]:
         if not fresh:
-            cached = _pool_usage_cache_get("opencode-go", entry.id)
-            if cached is not None:
-                return cached
+            # Cache-only contract: fresh=False (push emissions) never hits
+            # the network; the fresh=True background refresh owns live
+            # fetches. A cache miss yields None → the row is omitted.
+            return _pool_usage_cache_get("opencode-go", entry.id)
         token = str(entry.runtime_api_key or "").strip()
         if not token:
             snapshot = _unavailable_pool_snapshot(
@@ -1363,6 +1380,14 @@ def _fetch_opencode_go_pool_usage_snapshots(
     except Exception:
         base_snapshots = [fetch_entry(entry) for entry in entries]
 
+    # Cache-only mode skips cache misses (snapshot None): ordinal labels keep
+    # their position among ALL visible rows so numbering never shifts when a
+    # later fresh fetch fills the gaps.
+    pairs = [
+        (index, entry, snapshot)
+        for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
+        if snapshot is not None
+    ]
     return tuple(
         replace(
             snapshot,
@@ -1370,7 +1395,7 @@ def _fetch_opencode_go_pool_usage_snapshots(
             account_label=f"OpenCode Go {index}",
             active=entry.id == effective_active_id,
         )
-        for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
+        for index, entry, snapshot in pairs
     )
 
 
@@ -1388,14 +1413,18 @@ def fetch_pool_account_usage(
     Expired/rejected standby credentials therefore appear as unavailable until
     normal inference routing refreshes them.
 
-    ``fresh=True`` bypasses the per-entry 60s cache: every entry is fetched
-    from the backend, and the fresh result is written back through the cache so
-    later cached emissions immediately see the new numbers (the stale entry is
-    invalidated, not just skipped). This is the end-of-turn surface — the
-    caller decides when a completed turn's quota change is worth a fetch — and
-    deliberately adds no polling or auth refresh of its own. Failure isolation
-    is unchanged: a failing entry still yields an unavailable snapshot while
-    the others report live numbers.
+    Cache-only contract: ``fresh=False`` (every push emission — session.info,
+    status bar) returns cached entries only, skipping cache misses entirely
+    (no network), so a push emit can never block the turn loop on an HTTP
+    call. ``fresh=True`` bypasses the per-entry 60s cache: every entry is
+    fetched from the backend, and the fresh result is written back through
+    the cache so later cached emissions immediately see the new numbers (the
+    stale entry is invalidated, not just skipped). This is the background
+    refresh worker / explicit /usage surface — the caller decides when a
+    completed turn's quota change is worth a fetch — and deliberately adds no
+    polling or auth refresh of its own. Failure isolation is unchanged: a
+    failing entry still yields an unavailable snapshot while the others
+    report live numbers.
 
     ``opencode-go`` enumerates its persisted pool rows the same read-only way
     as the Codex entries (raw ``read_credential_pool`` + ``PooledCredential
@@ -1440,11 +1469,12 @@ def fetch_pool_account_usage(
             entries[0].id,
         )
 
-    def fetch_entry(entry) -> AccountUsageSnapshot:
+    def fetch_entry(entry) -> Optional[AccountUsageSnapshot]:
         if not fresh:
-            cached = _pool_usage_cache_get(normalized, entry.id)
-            if cached is not None:
-                return cached
+            # Cache-only contract: fresh=False (push emissions) never hits
+            # the network; the fresh=True background refresh owns live
+            # fetches. A cache miss yields None → the row is omitted.
+            return _pool_usage_cache_get(normalized, entry.id)
         token = str(entry.runtime_api_key or "").strip()
         if not token:
             snapshot = _unavailable_pool_snapshot("No usable OAuth access token is stored for this account.")
@@ -1478,6 +1508,14 @@ def fetch_pool_account_usage(
     except Exception:
         base_snapshots = [fetch_entry(entry) for entry in entries]
 
+    # Cache-only mode skips cache misses (snapshot None): ordinal labels keep
+    # their position among ALL visible rows so numbering never shifts when a
+    # later fresh fetch fills the gaps.
+    pairs = [
+        (index, entry, snapshot)
+        for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
+        if snapshot is not None
+    ]
     return tuple(
         replace(
             snapshot,
@@ -1485,7 +1523,7 @@ def fetch_pool_account_usage(
             account_label=f"Codex {index}",
             active=entry.id == effective_active_id,
         )
-        for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
+        for index, entry, snapshot in pairs
     )
 
 

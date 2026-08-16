@@ -2007,12 +2007,19 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     #    dependencies into the hot path.
     did_install = False
     termux_startup = _is_termux_startup_environment()
-    termux_need_rebuild = False
-    if termux_startup and not tui_dev:
-        termux_need_rebuild = _tui_need_rebuild(tui_dir)
+    # One freshness computation for both consumers below (Termux install skip
+    # and the build gate): the mtime walk is ~ms and nothing between here and
+    # the build gate rewrites the TUI sources (npm install only touches
+    # node_modules + lockfiles, which are not build inputs).
+    tui_need_rebuild = False
+    if not tui_dev:
+        try:
+            tui_need_rebuild = _tui_need_rebuild(tui_dir)
+        except Exception:
+            tui_need_rebuild = True  # fail-safe: unknown staleness → rebuild
 
     skip_install_for_fresh_termux_bundle = (
-        termux_startup and not tui_dev and not termux_need_rebuild
+        termux_startup and not tui_dev and not tui_need_rebuild
     )
     if (
         not skip_install_for_fresh_termux_bundle
@@ -2119,12 +2126,13 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             return [str(tsx), "src/entry.tsx"], tui_dir
         return [npm, "start"], tui_dir
 
-    # Desktop/dev launches retain the historical "always rebuild" behaviour.
-    # Termux cold starts use the freshness check because esbuild startup is
-    # expensive on old mobile CPUs.
-    should_build = True
-    if termux_startup:
-        should_build = did_install or termux_need_rebuild
+    # Rebuild only when the bundle is actually stale. Non-Termux launches
+    # historically always rebuilt, but esbuild startup costs ~1-3s on EVERY
+    # launch for zero benefit when dist/entry.js is already newer than the
+    # sources — the same mtime freshness check Termux uses (tui_need_rebuild
+    # above, honoring HERMES_TUI_FORCE_BUILD=1 for the old behaviour). A fresh
+    # npm install forces a rebuild (dependencies changed the bundle inputs).
+    should_build = did_install or tui_need_rebuild
 
     if should_build:
         npm = _node_bin("npm")

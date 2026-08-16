@@ -46,14 +46,20 @@ class PoolAccountUsageTests(unittest.TestCase):
         self.fake_pool_module = types.ModuleType("agent.credential_pool")
         self.fake_pool_module.PooledCredential = _FakePooledCredential
 
-    def _run(self, fetcher, *, active_entry_id="entry-b", fresh=False):
+    def _run(self, fetcher, *, active_entry_id="entry-b", fresh=False, rows=None):
         with (
             patch.dict(sys.modules, {"agent.credential_pool": self.fake_pool_module}),
-            patch.object(account_usage, "read_credential_pool", return_value=self.rows),
+            patch.object(
+                account_usage,
+                "read_credential_pool",
+                return_value=self.rows if rows is None else rows,
+            ),
             patch.object(account_usage, "_fetch_codex_account_usage_with_credentials", side_effect=fetcher),
         ):
             return account_usage.fetch_pool_account_usage(
-                "openai-codex", active_entry_id=active_entry_id, fresh=fresh
+                "openai-codex",
+                active_entry_id=active_entry_id,
+                fresh=fresh,
             )
 
     def test_two_entries_are_bound_isolated_and_secret_safe(self):
@@ -71,7 +77,7 @@ class PoolAccountUsageTests(unittest.TestCase):
                 windows=(account_usage.AccountUsageWindow("Session", used_percent=used),),
             )
 
-        snapshots = self._run(fetcher)
+        snapshots = self._run(fetcher, fresh=True)
         self.assertEqual(len(snapshots), 2)
         self.assertEqual({call[0] for call in calls}, {"synthetic-token-a", "synthetic-token-b"})
         self.assertTrue(all(call[2] is None for call in calls))
@@ -96,7 +102,7 @@ class PoolAccountUsageTests(unittest.TestCase):
                 details=("available",),
             )
 
-        snapshots = self._run(fetcher)
+        snapshots = self._run(fetcher, fresh=True)
         self.assertEqual(len(snapshots), 2)
         self.assertFalse(snapshots[0].available)
         self.assertTrue(snapshots[1].available)
@@ -125,7 +131,7 @@ class PoolAccountUsageTests(unittest.TestCase):
                 details=("available",),
             )
 
-        snapshots = self._run(fetcher)
+        snapshots = self._run(fetcher, fresh=True)
 
         self.assertCountEqual(calls, account_ids)
         rendered = repr(
@@ -156,8 +162,10 @@ class PoolAccountUsageTests(unittest.TestCase):
                 details=(token[-1],),
             )
 
-        first = self._run(fetcher, active_entry_id="entry-a")
-        second = self._run(fetcher, active_entry_id="entry-b")
+        first = self._run(fetcher, active_entry_id="entry-a", fresh=True)
+        # Cache-only second pass: entry-a is served from its cache entry,
+        # entry-b is fetched — the cache is keyed per entry id.
+        second = self._run(fetcher, active_entry_id="entry-b", fresh=False)
         self.assertCountEqual(calls, ["synthetic-token-a", "synthetic-token-b"])
         self.assertEqual(first[0].details, ("a",))
         self.assertEqual(first[1].details, ("b",))
@@ -183,7 +191,7 @@ class PoolAccountUsageTests(unittest.TestCase):
             )
 
         # Warm the 60s per-entry cache with a normal (cached) enumeration.
-        first = self._run(fetcher)
+        first = self._run(fetcher, fresh=True)
         self.assertEqual(len(calls), 2)
         self.assertEqual([item.windows[0].used_percent for item in first], [13.0, 58.0])
 
@@ -231,7 +239,7 @@ class PoolAccountUsageTests(unittest.TestCase):
                 windows=(account_usage.AccountUsageWindow("Session", used_percent=used),),
             )
 
-        self._run(fetcher)  # warm the cache
+        self._run(fetcher, fresh=True)  # warm the cache
 
         def fresh_fetcher(token, _base_url, _account_id=None):
             if token.endswith("a"):
@@ -248,6 +256,72 @@ class PoolAccountUsageTests(unittest.TestCase):
         self.assertFalse(snapshots[0].available)
         self.assertNotIn("synthetic", snapshots[0].unavailable_reason or "")
         self.assertEqual(snapshots[1].windows[0].used_percent, 77.0)
+
+    # ── Cache-only default (fresh=False never fetches) ──────────────────────
+
+    def _codex_snapshot(self, *, used=13.0):
+        return account_usage.AccountUsageSnapshot(
+            provider="openai-codex",
+            source="usage_api",
+            fetched_at=account_usage._utc_now(),
+            windows=(account_usage.AccountUsageWindow("Session", used_percent=used),),
+        )
+
+    def test_default_cold_cache_fetches_nothing(self):
+        def boom(*_args, **_kwargs):
+            self.fail("cache-only default must never perform a fetch")
+
+        self.assertEqual(self._run(boom), ())
+
+    def test_default_warm_cache_served_without_fetch(self):
+        calls = []
+
+        def fetcher(token, _base_url, _account_id=None):
+            calls.append(token)
+            return self._codex_snapshot(used=float(len(token)))
+
+        warmed = self._run(fetcher, fresh=True)
+        self.assertEqual(len(calls), 2)
+        calls.clear()
+
+        served = self._run(lambda *_a, **_k: self.fail("must not fetch"))
+        self.assertEqual([s.credential_id for s in served], ["entry-a", "entry-b"])
+        self.assertEqual(
+            [s.windows[0].used_percent for s in served],
+            [s.windows[0].used_percent for s in warmed],
+        )
+        self.assertEqual(calls, [])
+
+    def test_fresh_still_fetches_with_warm_cache(self):
+        calls = []
+
+        def fetcher(token, _base_url, _account_id=None):
+            calls.append(token)
+            return self._codex_snapshot(used=float(len(token)))
+
+        self._run(fetcher, fresh=True)  # warm the cache
+        calls.clear()
+
+        served = self._run(fetcher, fresh=True)
+        self.assertEqual(len(calls), 2, "fresh=True must bypass the cache and fetch")
+        self.assertEqual([s.credential_id for s in served], ["entry-a", "entry-b"])
+
+    def test_default_skips_missing_rows_keeps_ordinals(self):
+        def fetcher(token, _base_url, _account_id=None):
+            return self._codex_snapshot(used=float(len(token)))
+
+        # Warm ONLY entry-a (its row alone), then enumerate the FULL pool
+        # with the cache-only default: entry-b is a cache miss and must be
+        # skipped, and the surviving ordinal keeps its position among ALL
+        # visible rows.
+        warmed = self._run(fetcher, fresh=True, rows=[self.rows[0]])
+        self.assertEqual([s.credential_id for s in warmed], ["entry-a"])
+
+        served = self._run(
+            lambda *_a, **_k: self.fail("must not fetch on miss"),
+        )
+        self.assertEqual([s.credential_id for s in served], ["entry-a"])
+        self.assertEqual([s.account_label for s in served], ["Codex 1"])
 
 
 if __name__ == "__main__":
