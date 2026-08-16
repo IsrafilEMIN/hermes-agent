@@ -1083,6 +1083,19 @@ def resolve_billing_route(
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    # opencode-go (and a bare "deepseek" provider) serve DeepSeek models at
+    # the official API rates. The official-docs snapshot keys are keyed on
+    # provider='deepseek', so normalize the family onto it — same idiom as
+    # the minimax/google/fireworks branches. Non-DeepSeek models routed
+    # through opencode-go miss every key and stay unpriced, identical to
+    # today's behavior.
+    if provider_name in {"opencode-go", "deepseek"}:
+        return BillingRoute(
+            provider="deepseek",
+            model=model.split("/")[-1],
+            base_url=base_url or "",
+            billing_mode="official_docs_snapshot",
+        )
     # Google AI Studio (Gemini) and Vertex AI host the same Gemini models.
     # Price them off the official docs snapshot — the pricing keys are
     # keyed on provider='google', so normalize every Google-flavored

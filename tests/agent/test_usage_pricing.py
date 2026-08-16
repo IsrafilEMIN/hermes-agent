@@ -126,6 +126,64 @@ def test_deepseek_deprecated_aliases_price_as_v4_flash():
 
 
 
+def test_opencode_go_deepseek_models_price_off_official_snapshot():
+    """opencode-go serves DeepSeek models at the official API rates. Before
+    the provider-family normalization, opencode-go rows never matched the
+    ('deepseek', <model>) pricing keys and est$ stayed $0.00 for every
+    opencode-go session regardless of volume."""
+    flash = get_pricing_entry("deepseek-v4-flash", provider="opencode-go")
+    assert flash is not None
+    assert flash.input_cost_per_million == Decimal("0.14")
+    assert flash.output_cost_per_million == Decimal("0.28")
+    assert flash.cache_read_cost_per_million == Decimal("0.0028")
+
+    pro = get_pricing_entry("deepseek-v4-pro", provider="opencode-go")
+    assert pro is not None
+    assert pro.input_cost_per_million == Decimal("0.435")
+    assert pro.output_cost_per_million == Decimal("0.87")
+
+
+def test_opencode_go_route_normalizes_to_deepseek_family():
+    """The route must land on the deepseek family with the docs-snapshot
+    billing mode so cost_status reports 'estimated', and vendor-prefixed
+    model ids must strip to the pricing key."""
+    route = resolve_billing_route("deepseek-v4-flash", provider="opencode-go")
+    assert route.provider == "deepseek"
+    assert route.billing_mode == "official_docs_snapshot"
+    prefixed = resolve_billing_route("deepseek/deepseek-v4-flash", provider="opencode-go")
+    assert prefixed.model == "deepseek-v4-flash"
+    bare = resolve_billing_route("deepseek-v4-flash", provider="deepseek")
+    assert bare.provider == "deepseek"
+    assert bare.billing_mode == "official_docs_snapshot"
+
+
+def test_opencode_go_non_deepseek_models_stay_unpriced():
+    """GLM/Qwen/Kimi through opencode-go must NOT be priced at DeepSeek
+    rates — they miss every key and stay unknown, exactly as before."""
+    entry = get_pricing_entry("glm-5.3", provider="opencode-go")
+    assert entry is None
+    cost = estimate_usage_cost(
+        "glm-5.3", CanonicalUsage(input_tokens=1000), provider="opencode-go",
+    )
+    assert cost.status == "unknown"
+    assert cost.amount_usd is None
+
+
+def test_opencode_go_cost_estimate_matches_deepseek_direct():
+    """The same model+usage through opencode-go and direct deepseek must
+    estimate the identical amount — they resolve to the same snapshot
+    entry, including cache-read tokens at the discounted rate."""
+    usage = CanonicalUsage(
+        input_tokens=1_000_000, output_tokens=100_000, cache_read_tokens=500_000,
+    )
+    via_go = estimate_usage_cost("deepseek-v4-flash", usage, provider="opencode-go")
+    via_direct = estimate_usage_cost("deepseek-v4-flash", usage, provider="deepseek")
+    assert via_go.amount_usd == via_direct.amount_usd
+    assert via_go.status == "estimated"
+    # 1M input at 0.14 + 100K output at 0.28 + 500K cache-read at 0.0028
+    assert via_go.amount_usd == Decimal("0.14") + Decimal("0.028") + Decimal("0.0014")
+
+
 def test_bedrock_claude_rows_all_carry_cache_pricing():
     """Invariant: every Bedrock Claude pricing row must carry cache-read AND
     cache-write rates, otherwise a cached session prices as ``unknown``.
