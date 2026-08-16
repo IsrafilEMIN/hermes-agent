@@ -71,6 +71,38 @@ describe('/usage slash command', () => {
     expect(printed(withBalance.sys)).toContain(USAGE_CTA)
   })
 
+  it('suppresses "no API calls yet" when quota panels rendered with zero session calls', async () => {
+    // The quota panels are agent-independent live provider fetches; a fresh
+    // agent, resumed session, or gateway restart legitimately has calls == 0
+    // while the panels show real numbers. The placeholder must never
+    // contradict rendered quota panels (regression: it printed alongside a
+    // successful OpenCode Go limits panel).
+    const { panel, run, sys } = buildCtx({
+      'session.usage': baseUsage({
+        calls: 0,
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'Go 1',
+            provider: 'opencode-go',
+            windows: [
+              { label: 'Rolling 5h', used_percent: 0, reset_human: 'in 4h 37m' },
+              { label: 'Weekly', used_percent: 48 },
+              { label: 'Monthly', used_percent: 51 }
+            ]
+          }
+        ]
+      })
+    })
+
+    await run('')
+
+    expect(printed(sys)).not.toContain('no API calls yet')
+    expect(printed(sys)).toContain(USAGE_CTA)
+    expect(panel.mock.calls.some(c => c[0] === 'OpenCode Go limits')).toBe(true)
+  })
+
   it('renders the dollar two-bar model (no "credits" wording) when available', async () => {
     const { panel, run } = buildCtx({
       'session.usage': baseUsage({

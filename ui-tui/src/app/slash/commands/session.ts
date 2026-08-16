@@ -672,14 +672,23 @@ export const sessionCommands: SlashCommand[] = [
           }))
         }
 
+        // Quota panels come from live provider fetches and are agent-independent:
+        // they render even when the session agent's in-memory call counter is
+        // still zero (fresh agent, resumed session, or gateway restart). Track
+        // them so the "no API calls yet" placeholder below only fires on a
+        // genuinely empty page — never next to rendered quota panels.
         const accountLines = codexUsageDetails(r?.accounts)
+        const goLines = openCodeGoUsageDetails(r?.accounts)
+        let showedQuotaPanels = false
+
         if (accountLines.length) {
           ctx.transcript.panel('Codex limits', [{ text: accountLines.join('\n') }])
+          showedQuotaPanels = true
         }
 
-        const goLines = openCodeGoUsageDetails(r?.accounts)
         if (goLines.length) {
           ctx.transcript.panel('OpenCode Go limits', [{ text: goLines.join('\n') }])
+          showedQuotaPanels = true
         }
 
         // Nous balance block is agent-independent (a portal fetch), so it shows
@@ -724,7 +733,7 @@ export const sessionCommands: SlashCommand[] = [
         }
 
         if (!r?.calls) {
-          if (!showedBalance) {
+          if (!showedBalance && !showedQuotaPanels) {
             sys('no API calls yet')
           }
 
