@@ -59,12 +59,10 @@ describe('statusRuleWidths', () => {
 })
 
 describe('statusBarSegments', () => {
-  it('shows every segment on a wide terminal', () => {
+  it('shows every tail segment on a wide terminal', () => {
     const s = statusBarSegments(120)
 
     expect(s).toEqual({
-      compactCtx: false,
-      bar: true,
       duration: true,
       compressions: true,
       voice: true,
@@ -73,24 +71,16 @@ describe('statusBarSegments', () => {
     } satisfies StatusBarSegments)
   })
 
-  it('collapses the context bar to a token count on narrow terminals', () => {
+  it('keeps the context percentage as essential content on narrow terminals', () => {
     const s = statusBarSegments(60)
 
-    expect(s.compactCtx).toBe(true)
-    expect(s.bar).toBe(false)
     expect(s.duration).toBe(false)
+    expect(s.compressions).toBe(false)
+    expect(s.voice).toBe(false)
   })
 
   it('sheds tail segments in priority order as the terminal narrows', () => {
-    // the context bar is the last of the tail to go.
-    const order: (keyof ReturnType<typeof statusBarSegments>)[] = [
-      'bar',
-      'duration',
-      'compressions',
-      'voice',
-      'bg',
-      'subagents'
-    ]
+    const order: (keyof StatusBarSegments)[] = ['duration', 'compressions', 'voice', 'bg', 'subagents']
 
     let prevCount = Infinity
 

@@ -342,9 +342,8 @@ export interface UiState {
   /** TUI status bar: show the session auto-title badge instead of the
    *  cwd/workspace label. Default true; never affects the terminal title. */
   showSessionTitle: boolean
-  /** TUI status bar: show the numeric context read-out (e.g. `50k/200k`)
-   *  next to the model. Default true. When false only the numeric label is
-   *  hidden — the fill bar + percentage still render where the bar shows. */
+  /** TUI status bar: show the context percentage (for example, `10.3%`)
+   *  next to the model. Default true. */
   showContextLabel: boolean
   indicatorStyle: IndicatorStyle
   sid: null | string

@@ -291,8 +291,7 @@ export const applyDisplay = (
     // Backward compatible: absent ⇒ on. Only gates the status-bar session
     // title badge; the terminal tab/window title is untouched.
     showSessionTitle: d.show_session_title !== false,
-    // Backward compatible: absent ⇒ on. Gates only the numeric context
-    // read-out; the fill bar + percentage still render where the bar shows.
+    // Backward compatible: absent ⇒ on. Gates the context percentage label.
     showContextLabel: d.show_context_label !== false,
     statusBar: normalizeStatusBar(d.tui_statusbar),
     streaming: d.streaming !== false,

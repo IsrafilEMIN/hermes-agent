@@ -180,24 +180,29 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
   )
 }
 
-function ctxBarColor(pct: number | undefined, t: Theme) {
+// Compute the display percentage from raw token counts when available so the
+// status bar can show useful precision (for example, 28k/272k → 10.3%).
+// Older or partial usage payloads may only carry context_percent, so retain it
+// as a fallback.
+function contextPercent(usage: Usage): null | number {
+  if (typeof usage.context_used === 'number' && typeof usage.context_max === 'number' && usage.context_max > 0) {
+    return Math.max(0, Math.min(100, (usage.context_used / usage.context_max) * 100))
+  }
+
+  return typeof usage.context_percent === 'number' ? Math.max(0, Math.min(100, usage.context_percent)) : null
+}
+
+function contextPercentLabel(usage: Usage): string {
+  const pct = contextPercent(usage)
+
   if (pct == null) {
-    return t.color.muted
+    return ''
   }
 
-  if (pct >= 95) {
-    return t.color.statusCritical
-  }
+  const percent = `${pct.toFixed(1).replace(/\.0$/, '')}%`
+  const total = typeof usage.context_max === 'number' && usage.context_max > 0 ? `/${fmtK(usage.context_max)}` : ''
 
-  if (pct > 80) {
-    return t.color.statusBad
-  }
-
-  if (pct >= 50) {
-    return t.color.statusWarn
-  }
-
-  return t.color.statusGood
+  return `${percent}${total}`
 }
 
 function statusSessionCountLabel(count: number) {
@@ -205,7 +210,7 @@ function statusSessionCountLabel(count: number) {
 }
 
 // Colour the battery read-out by its (Python-computed) category. Inverted vs
-// the context bar — a full battery is "good", an empty one "critical".
+// the context percentage — a full battery is "good", an empty one "critical".
 function batteryColor(info: BatteryInfo, t: Theme): string {
   if (info.category === 'good') {
     return t.color.statusGood
@@ -252,13 +257,6 @@ function noticeColor(level: Notice['level'], t: Theme): string {
   return t.color.accent
 }
 
-function ctxBar(pct: number | undefined, w = 10) {
-  const p = Math.max(0, Math.min(100, pct ?? 0))
-  const filled = Math.round((p / 100) * w)
-
-  return '█'.repeat(filled) + '░'.repeat(w - filled)
-}
-
 // `minLeftContent` is the display width of the high-priority left segments
 // (status indicator + model + context). Reserving it makes the cwd/branch
 // segment on the right yield FIRST on narrow terminals, instead of squeezing
@@ -267,9 +265,6 @@ export function statusRuleWidths(cols: number, cwdLabel: string, minLeftContent 
   const width = Math.max(1, Math.floor(cols || 1))
   const desiredSeparatorWidth = width >= 24 ? 3 : 1
   const baseMinLeft = width >= 24 ? 8 : 1
-  // Never reserve more than the terminal width; never less than the historical
-  // floor. With the default `minLeftContent = 0` this is identical to the old
-  // behaviour, so callers that don't pass content are unaffected.
   const minLeftWidth = Math.min(width, Math.max(baseMinLeft, Math.floor(minLeftContent)))
   const maxRightWidth = Math.max(0, width - desiredSeparatorWidth - minLeftWidth)
 
@@ -286,25 +281,20 @@ export function statusRuleWidths(cols: number, cwdLabel: string, minLeftContent 
 
 // Progressive disclosure for the status rule's lower-priority tail segments.
 // As the terminal narrows we shed the least important pieces first (cost →
-// bg → voice → compressions → duration → context bar), and below the bar
-// breakpoint the context read-out collapses to a bare token count. Status and
-// model are never gated here — they're guaranteed room by `statusRuleWidths`.
+// bg → voice → compressions → duration). Status, model, and context percentage
+// are essential left content and are never tail-budgeted.
 export interface StatusBarSegments {
-  bar: boolean
-  bg: boolean
-  compactCtx: boolean
   compressions: boolean
   duration: boolean
   subagents: boolean
   voice: boolean
+  bg: boolean
 }
 
 export function statusBarSegments(cols: number): StatusBarSegments {
   const w = Math.max(1, Math.floor(cols || 1))
 
   return {
-    compactCtx: w < 72,
-    bar: w >= 72,
     duration: w >= 76,
     compressions: w >= 80,
     voice: w >= 84,
@@ -490,27 +480,12 @@ export function StatusRule({
   onSessionCountClick,
   t
 }: StatusRuleProps) {
-  const pct = usage.context_percent
-  const barColor = ctxBarColor(pct, t)
   const segs = statusBarSegments(cols)
 
-  // On narrow terminals the context read-out collapses to a bare token count
-  // (`12k tok`) and the visual fill bar is dropped entirely. The numeric
-  // label is gated by display.show_context_label (absent ⇒ on): when false,
-  // only this label is hidden — the fill bar + percentage below still render
-  // at widths where the bar shows.
-  const ctxLabel =
-    showContextLabel === false
-      ? ''
-      : usage.context_max
-        ? segs.compactCtx
-          ? `${fmtK(usage.context_used ?? 0)} tok`
-          : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
-        : usage.total > 0
-          ? `${fmtK(usage.total)} tok`
-          : ''
-
-  const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
+  // The context read-out is a compact percentage derived from the raw token
+  // counts (for example, `28k/272k` becomes `10.3%`). It remains gated by
+  // display.show_context_label (absent ⇒ on).
+  const ctxLabel = showContextLabel === false ? '' : contextPercentLabel(usage)
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
   const codexUsageText = formatCodexUsage(usage.accounts, cols)
   // OpenCode Go quota rides its own status segment (never mixed into the
@@ -571,8 +546,8 @@ export function StatusRule({
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
   // if it fits in the space left after the pinned essentials, evaluated in
-  // descending priority order — bar, duration, compressions, voice, session
-  // count, bg, cost. Lower-priority segments drop first and nothing truncates
+  // descending priority order — duration, compressions, voice, session count,
+  // bg, cost. Lower-priority segments drop first and nothing truncates
   // mid-segment, so status/model/context are never crushed.
   const SEP = stringWidth(' │ ')
   let tailBudget = Math.max(0, leftWidth - essentialWidth)
@@ -599,7 +574,6 @@ export function StatusRule({
       ? `Δ ${(usage.dev_credits_spent_micros / 10000).toFixed(1)}¢`
       : ''
 
-  const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
   const showDuration = segs.duration && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
 
   // Idle clock — time since the last final agent response. Hidden while busy
@@ -714,12 +688,6 @@ export function StatusRule({
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
             {goUsageText}
-          </Text>
-        ) : null}
-        {showBar ? (
-          <Text color={t.color.muted} wrap="truncate-end">
-            {' │ '}
-            <Text color={barColor}>[{bar}]</Text> <Text color={barColor}>{pct != null ? `${pct}%` : ''}</Text>
           </Text>
         ) : null}
         {showDuration ? (
@@ -917,10 +885,8 @@ interface StatusRuleProps {
    *  exists — the slot is left blank (no cwd label fallback). Absent ⇒ true.
    *  Never affects the terminal tab/window title. */
   showSessionTitle?: boolean
-  /** display.show_context_label: show the numeric context read-out
-   *  (e.g. `50k/200k`) next to the model. Absent ⇒ true. When false only
-   *  the numeric label is hidden — the fill bar + percentage still render
-   *  at widths where the bar normally shows. */
+  /** display.show_context_label: show the context percentage (for example,
+   *  `10.3%`) next to the model. Absent ⇒ true. */
   showContextLabel?: boolean
   status: string
   statusColor: string
