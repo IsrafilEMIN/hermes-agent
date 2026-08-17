@@ -65,7 +65,7 @@ export function codexUsageDetails(accounts: CodexUsageAccount[] | undefined): st
   })
 }
 
-// ── OpenCode Go (single env-backed account, read-only) ──────────────────────
+// ── OpenCode Go (env-backed and/or pool rows, read-only) ───────────────────
 
 const openCodeGoWindow = (account: CodexUsageAccount | undefined, kind: 'rolling' | 'weekly' | 'monthly') =>
   (account?.windows ?? []).find(window => {
@@ -74,21 +74,26 @@ const openCodeGoWindow = (account: CodexUsageAccount | undefined, kind: 'rolling
   })
 
 /**
- * Compact status segment for the env-backed OpenCode Go account:
- * `Go ● <rolling>/<weekly>/<monthly>` remaining percentages (one persistent
- * active-state circle, `●` active / `○` inactive), `?` per missing window.
- * Never exposes account labels or credential-derived identifiers.
+ * Compact status segment for the OpenCode Go account(s):
+ * `Go ● <rolling>/<weekly>/<monthly> ○ <rolling>/<weekly>/<monthly>`
+ * remaining percentages — one persistent circle per account (`●` active /
+ * `○` inactive), `?` per missing window. Renders every Go account exactly
+ * like the Codex slot (active row first, then inactive rows in payload
+ * order), so a multi-credential pool shows the same ●/○ shape the Codex
+ * segment does. Never exposes account labels or credential-derived
+ * identifiers.
  */
 export function formatOpenCodeGoUsage(accounts: CodexUsageAccount[] | undefined): string {
   const visible = (accounts ?? []).filter(account => account.provider === 'opencode-go')
   if (!visible.length) return ''
   // The pool can emit the inactive account before the active one; the status
-  // segment must always reflect the active row when one exists, falling back
-  // to the first row only when no account is active.
-  const go = visible.find(account => account.active) ?? visible[0]
+  // segment must always lead with the active row when one exists, keeping
+  // payload order for the rest (stable sort — inactive rows stay in order).
+  const ordered = [...visible].sort((a, b) => Number(b.active ?? false) - Number(a.active ?? false))
   const fmt = (value: number | null) => (value == null ? '?' : String(value))
-  const marker = accountMarker(go)
-  return `Go ${marker} ${fmt(remaining(openCodeGoWindow(go, 'rolling')))}/${fmt(remaining(openCodeGoWindow(go, 'weekly')))}/${fmt(remaining(openCodeGoWindow(go, 'monthly')))}`
+  const one = (account: CodexUsageAccount) =>
+    `${accountMarker(account)} ${fmt(remaining(openCodeGoWindow(account, 'rolling')))}/${fmt(remaining(openCodeGoWindow(account, 'weekly')))}/${fmt(remaining(openCodeGoWindow(account, 'monthly')))}`
+  return `Go ${ordered.map(one).join(' ')}`
 }
 
 /** Detailed /usage block: `OpenCode Go` heading + rolling/weekly/monthly lines. */

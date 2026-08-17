@@ -169,7 +169,7 @@ describe('pool-aware Codex usage formatting', () => {
   })
 })
 
-describe('OpenCode Go (env-backed) usage formatting', () => {
+describe('OpenCode Go (env-backed and/or pool rows) usage formatting', () => {
   // The gateway never sends credential identifiers; even if one leaked into
   // the label it must never surface in the status read-out or details.
   const goAccounts: CodexUsageAccount[] = [
@@ -204,7 +204,7 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
     expect(formatOpenCodeGoUsage(inactive)).toBe('Go ○ 90/59/53')
   })
 
-  it('shows the active row when the backend emits an inactive Go account before the active one', () => {
+  it('leads with the active row when the backend emits an inactive Go account before it', () => {
     const outOfOrder: CodexUsageAccount[] = [
       {
         ...goAccounts[0],
@@ -218,9 +218,29 @@ describe('OpenCode Go (env-backed) usage formatting', () => {
       { ...goAccounts[0] } // active, 90/59/53 remaining
     ]
 
-    // Regression: visible[0] would read the inactive row (`Go ○ 40/10/5`);
-    // the status must reflect the active row's marker and values.
-    expect(formatOpenCodeGoUsage(outOfOrder)).toBe('Go ● 90/59/53')
+    // Regression: active-first ordering keeps the marker shape stable
+    // regardless of payload order — the active row leads, the inactive row
+    // follows with its own circle and windows.
+    expect(formatOpenCodeGoUsage(outOfOrder)).toBe('Go ● 90/59/53 ○ 40/10/5')
+  })
+
+  it('renders every Go pool account like the Codex slot (active first, inactive follow)', () => {
+    const two: CodexUsageAccount[] = [
+      {
+        ...goAccounts[0],
+        active: false,
+        windows: [
+          { label: 'Rolling 5h', used_percent: 1 },
+          { label: 'Weekly', used_percent: 2 },
+          { label: 'Monthly', used_percent: 3 }
+        ]
+      },
+      { ...goAccounts[0] } // active, 90/59/53 remaining
+    ]
+
+    // Two creds → one ● per account, exactly the shape of the Codex slot:
+    // `GPT ● 13/… ○ 60/…` becomes `Go ● 90/59/53 ○ 99/98/97`.
+    expect(formatOpenCodeGoUsage(two)).toBe('Go ● 90/59/53 ○ 99/98/97')
   })
 
   it('renders Go ● ?/?/? for an unavailable account', () => {
