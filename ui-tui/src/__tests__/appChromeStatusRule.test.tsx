@@ -167,51 +167,69 @@ describe('StatusRule session title', () => {
   })
 })
 
-describe('StatusRule context label toggle', () => {
-  it('shows the numeric context read-out and the fill bar by default (flag absent)', () => {
-    const element = StatusRule({ ...baseProps })
-
-    const rendered = textContent(element)
-
-    expect(rendered).toContain('50k/200k')
-    expect(rendered).toContain('25%')
-    expect(rendered).toContain('█')
-  })
-
-  it('hides only the numeric label when showContextLabel is off, keeping the bar + percentage', () => {
-    const element = StatusRule({ ...baseProps, showContextLabel: false })
-
-    const rendered = textContent(element)
-
-    expect(rendered).not.toContain('50k/200k')
-    expect(rendered).not.toContain('50k')
-    // The fill bar + percentage still render at widths where the bar normally shows.
-    expect(rendered).toContain('25%')
-    expect(rendered).toContain('█')
-    // The bar keeps its separator even though the label slot is gone.
-    expect(rendered).toContain('[█')
-  })
-
-  it('hides the collapsed bare-token read-out on narrow terminals too', () => {
-    const element = StatusRule({ ...baseProps, cols: 60, showContextLabel: false })
-
-    const rendered = textContent(element)
-
-    // Compact read-out (`50k tok`) is a numeric label too — hidden as well.
-    expect(rendered).not.toContain('50k tok')
-    expect(rendered).not.toContain('tok')
-    // The bar never renders below its breakpoint, so no percentage either.
-    expect(rendered).not.toContain('%')
-  })
-
-  it('hides a total-only token read-out when showContextLabel is off', () => {
+describe('StatusRule context percentage', () => {
+  it('shows the computed context percentage over total capacity without a fill bar', () => {
     const element = StatusRule({
       ...baseProps,
-      showContextLabel: false,
-      usage: { total: 1234 }
+      usage: { context_max: 272_000, context_percent: 10, context_used: 28_000, total: 28_000 }
     })
 
-    expect(textContent(element)).not.toContain('tok')
+    const rendered = textContent(element)
+
+    expect(rendered).toContain('10.3%/272k')
+    expect(rendered).not.toContain('28k/272k')
+    expect(rendered).not.toContain('█')
+    expect(rendered).not.toContain('░')
+  })
+
+  it('uses the fallback context percentage when raw token counts are unavailable', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: { context_percent: 25, total: 50_000 }
+    })
+
+    expect(textContent(element)).toContain('25%')
+  })
+
+  it('hides the context percentage when showContextLabel is off', () => {
+    const element = StatusRule({ ...baseProps, showContextLabel: false })
+    const rendered = textContent(element)
+
+    expect(rendered).not.toContain('25%')
+    expect(rendered).not.toContain('50k/200k')
+    expect(rendered).not.toContain('█')
+  })
+
+  it('keeps the percentage over total on narrow terminals', () => {
+    const element = StatusRule({ ...baseProps, cols: 60 })
+    const rendered = textContent(element)
+
+    expect(rendered).toContain('25%/200k')
+    expect(rendered).not.toContain('tok')
+    expect(rendered).not.toContain('█')
+  })
+
+  it('does not invent a percentage for total-only usage', () => {
+    const element = StatusRule({ ...baseProps, usage: { total: 1234 } })
+
+    expect(textContent(element)).not.toContain('%')
+  })
+})
+describe('StatusRule credits notice render priority', () => {
+  it('replaces the idle status with the notice text and keeps model + context percentage', () => {
+    const element = StatusRule({
+      ...baseProps,
+      notice: { key: 'credits.depleted', kind: 'sticky', level: 'error', text: '✕ credits exhausted' }
+    })
+
+    const rendered = textContent(element)
+
+    // Notice replaces the status verb slot …
+    expect(rendered).toContain('✕ credits exhausted')
+    expect(rendered).not.toContain('ready')
+    // … but model + context stay visible.
+    expect(rendered).toContain('opus 4.8')
+    expect(rendered).toContain('25%/200k')
   })
 })
 
@@ -480,7 +498,7 @@ describe('StatusRule session count click target', () => {
 })
 
 describe('StatusRule credits notice render priority', () => {
-  it('replaces the idle status with the notice text and keeps model + context', () => {
+  it('replaces the idle status with the notice text and keeps model + context percentage', () => {
     const element = StatusRule({
       ...baseProps,
       notice: { key: 'credits.depleted', kind: 'sticky', level: 'error', text: '✕ credits exhausted' }
@@ -493,7 +511,7 @@ describe('StatusRule credits notice render priority', () => {
     expect(rendered).not.toContain('ready')
     // … but model + context stay visible.
     expect(rendered).toContain('opus 4.8')
-    expect(rendered).toContain('50k')
+    expect(rendered).toContain('25%/200k')
   })
 
   it('busy wins: the FaceTicker shows, the notice is hidden mid-turn', () => {
