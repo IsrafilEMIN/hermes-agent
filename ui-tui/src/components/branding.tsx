@@ -54,9 +54,9 @@ export function ArtLines({ lines }: { lines: [string, string][] }) {
 // Terminals can't scale glyphs, so "responsive" means picking a layout that
 // fits the available columns. Thresholds are picked so each tier reads
 // comfortably without forcing wrap or truncation drift on box-drawing edges.
-const TAG_FULL = 'Nous Research · Messenger of the Digital Gods'
-const TAG_MID = 'Messenger of the Digital Gods'
-const TAG_TINY = 'Nous Research'
+const TAG_FULL = '⚕ Nous Research'
+const TAG_MID = '⚕ Nous Research'
+const TAG_TINY = '⚕ Nous Research'
 const HIDE_BELOW = 34
 const COMPACT_FROM = 58
 
@@ -130,7 +130,7 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
             {
               children: (
                 <Text color={t.color.muted} wrap="truncate-end">
-                  {t.brand.icon} {TAG_FULL}
+                  {TAG_FULL}
                 </Text>
               ),
               id: 'banner-tagline'
@@ -179,7 +179,7 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
           {
             children: (
               <Text color={t.color.muted} wrap="truncate-end">
-                {t.brand.icon} {tag}
+                {tag}
               </Text>
             ),
             id: 'banner-tag'
