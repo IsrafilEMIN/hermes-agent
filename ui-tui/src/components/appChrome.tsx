@@ -11,7 +11,7 @@ import { DEV_CREDITS_MODE } from '../config/env.js'
 import { FACES } from '../content/faces.js'
 import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
-import { formatCodexUsage, formatOpenCodeGoUsage } from '../domain/usage.js'
+import { formatCodexUsage, formatOpenCodeGoUsage, formatXaiUsage } from '../domain/usage.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
@@ -495,6 +495,8 @@ export function StatusRule({
   // essentialWidth, rendered unconditionally when nonempty) instead of being
   // tail-budgeted away on a narrow terminal.
   const goUsageText = formatOpenCodeGoUsage(usage.accounts)
+  const xaiUsageText = formatXaiUsage(usage.accounts)
+
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery = !!battery && battery.available && battery.percent != null
@@ -535,7 +537,10 @@ export function StatusRule({
     (codexUsageText ? stringWidth(' │ ') + stringWidth(codexUsageText) : 0) +
     // Go is pinned like Codex: the current provider's quota must never be
     // shed by tail budgeting (see comment at goUsageText).
-    (goUsageText ? stringWidth(' │ ') + stringWidth(goUsageText) : 0)
+    (goUsageText ? stringWidth(' │ ') + stringWidth(goUsageText) : 0) +
+    // SuperGrok quota is pinned like Codex/Go: the current provider's
+    // usage must never be shed by tail budgeting.
+    (xaiUsageText ? stringWidth(' │ ') + stringWidth(xaiUsageText) : 0)
 
   // The session-title badge occupies the far-right slot only while enabled
   // (display.show_session_title). When disabled — or when no session title
@@ -688,6 +693,12 @@ export function StatusRule({
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
             {goUsageText}
+          </Text>
+        ) : null}
+        {xaiUsageText ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {xaiUsageText}
           </Text>
         ) : null}
         {showDuration ? (

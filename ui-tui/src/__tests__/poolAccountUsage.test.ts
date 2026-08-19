@@ -4,7 +4,9 @@ import {
   codexUsageDetails,
   formatCodexUsage,
   formatOpenCodeGoUsage,
-  openCodeGoUsageDetails
+  formatXaiUsage,
+  openCodeGoUsageDetails,
+  xaiUsageDetails
 } from '../domain/usage.js'
 import type { CodexUsageAccount } from '../types.js'
 
@@ -313,3 +315,97 @@ describe('OpenCode Go (env-backed and/or pool rows) usage formatting', () => {
     )
   })
 })
+
+describe('xAI OAuth / SuperGrok usage formatting', () => {
+  const xaiAccounts: CodexUsageAccount[] = [
+    {
+      active: true,
+      available: true,
+      label: 'xai-oauth-key-9f3c',
+      provider: 'xai-oauth',
+      windows: [
+        { label: 'Weekly', used_percent: 24, reset_human: 'in 2d' },
+        { label: 'Monthly', used_percent: 40 }
+      ]
+    }
+  ]
+
+  it('renders the full xAI circle + weekly/monthly remaining read-out', () => {
+    expect(formatXaiUsage(xaiAccounts)).toBe('xAI ● 76/60')
+  })
+
+  it('renders ? for missing windows instead of dropping the segment', () => {
+    const partial: CodexUsageAccount[] = [{ ...xaiAccounts[0], windows: [{ label: 'Weekly', used_percent: 24 }] }]
+    expect(formatXaiUsage(partial)).toBe('xAI ● 76/?')
+  })
+
+  it('keeps the persistent circle on a single account (○ when inactive)', () => {
+    expect(formatXaiUsage([{ ...xaiAccounts[0], active: false }])).toBe('xAI ○ 76/60')
+  })
+
+  it('leads with the active row when the backend emits an inactive account first', () => {
+    const outOfOrder: CodexUsageAccount[] = [
+      {
+        ...xaiAccounts[0],
+        active: false,
+        windows: [
+          { label: 'Weekly', used_percent: 80 },
+          { label: 'Monthly', used_percent: 90 }
+        ]
+      },
+      { ...xaiAccounts[0] }
+    ]
+    expect(formatXaiUsage(outOfOrder)).toBe('xAI ● 76/60 ○ 20/10')
+  })
+
+  it('renders every SuperGrok pool account like the Codex slot', () => {
+    const two: CodexUsageAccount[] = [
+      {
+        ...xaiAccounts[0],
+        active: false,
+        windows: [
+          { label: 'Weekly', used_percent: 1 },
+          { label: 'Monthly', used_percent: 2 }
+        ]
+      },
+      { ...xaiAccounts[0] }
+    ]
+    expect(formatXaiUsage(two)).toBe('xAI ● 76/60 ○ 99/98')
+  })
+
+  it('renders xAI ● ?/? for an unavailable account', () => {
+    expect(
+      formatXaiUsage([
+        {
+          active: true,
+          available: false,
+          label: 'xai-oauth-key-9f3c',
+          provider: 'xai-oauth',
+          unavailable_reason: 'The stored OAuth credential was rejected.',
+          windows: []
+        }
+      ])
+    ).toBe('xAI ● ?/?')
+  })
+
+  it('hides the segment entirely when no xAI account is present', () => {
+    expect(formatXaiUsage(undefined)).toBe('')
+    expect(formatXaiUsage([])).toBe('')
+    expect(formatXaiUsage(accounts)).toBe('')
+  })
+
+  it('keeps the constant xAI details heading with remaining/used/reset lines', () => {
+    const details = xaiUsageDetails(xaiAccounts).join('\n')
+    expect(details.split('\n')[0]).toBe('● xAI (active)')
+    expect(details).toContain('  Weekly: 76% remaining (24% used) · resets in 2d')
+    expect(details).toContain('  Monthly: 60% remaining (40% used)')
+  })
+
+  it('never surfaces the account label or credential identifiers in details', () => {
+    const details = xaiUsageDetails(xaiAccounts).join('\n')
+    expect(details).not.toContain('xai-oauth-key-9f3c')
+    expect(details).not.toContain('9f3c')
+    expect(details.split('\n')[0]).toBe('● xAI (active)')
+  })
+})
+

@@ -1094,6 +1094,372 @@ def _fetch_opencode_go_account_usage(
     return _fetch_opencode_go_account_usage_with_credentials(token, resolved_base_url)
 
 
+# ── xAI OAuth / SuperGrok billing (pool-aware, read-only) ───────────────────
+#
+# SuperGrok (`xai-oauth`) subscription quotas live on the Grok CLI billing
+# proxy, not on api.x.ai. Mirror OMP's xai-oauth usage provider:
+#   GET https://cli-chat-proxy.grok.com/v1/billing?format=credits  → weekly
+#   GET https://cli-chat-proxy.grok.com/v1/billing                 → monthly
+# The usage path never refreshes tokens, never loads/selects the pool, and
+# never writes auth.json.
+
+_XAI_OAUTH_BILLING_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+_XAI_OAUTH_BILLING_MONTHLY_URL = "https://cli-chat-proxy.grok.com/v1/billing"
+
+
+def _xai_oauth_billing_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+    }
+
+
+def _parse_usage_percent(value: Any) -> Optional[float]:
+    if not _is_finite_num(value) or value < 0 or value > 100:
+        return None
+    return float(value)
+
+
+def _parse_amount_val(value: Any) -> Optional[float]:
+    """Parse xAI `{val: N}` money/quota objects. Missing/negative → None."""
+    if not isinstance(value, dict):
+        return None
+    amount = value.get("val")
+    if not _is_finite_num(amount) or amount < 0:
+        return None
+    return float(amount)
+
+
+def _parse_xai_weekly_billing(config: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(config, dict):
+        return None
+    period = config.get("currentPeriod")
+    if not isinstance(period, dict):
+        return None
+    start = _parse_dt(period.get("start"))
+    end = _parse_dt(period.get("end"))
+    period_type = str(period.get("type") or "")
+    if start is None or end is None or end <= start or "WEEK" not in period_type.upper():
+        return None
+    raw_percent = config.get("creditUsagePercent")
+    inferred = raw_percent is None
+    if inferred:
+        # Fresh weekly periods omit the field; treat as 0% used only while
+        # the window is still open so a mid-rollover payload does not
+        # invent a 0% reading for an expired period.
+        credit_usage_percent = 0.0 if end > _utc_now() else None
+    else:
+        credit_usage_percent = _parse_usage_percent(raw_percent)
+    if credit_usage_percent is None:
+        return None
+    products: list[tuple[str, float]] = []
+    raw_products = config.get("productUsage")
+    if raw_products is not None:
+        if not isinstance(raw_products, list):
+            return None
+        for item in raw_products:
+            if not isinstance(item, dict):
+                continue
+            product = str(item.get("product") or "").strip()
+            raw_item_percent = item.get("usagePercent")
+            item_percent = 0.0 if raw_item_percent is None else _parse_usage_percent(raw_item_percent)
+            if not product or item_percent is None:
+                continue
+            products.append((product, item_percent))
+    return {
+        "kind": "weekly",
+        "end": end,
+        "credit_usage_percent": credit_usage_percent,
+        "inferred_percent": inferred,
+        "products": products,
+        "on_demand_cap": _parse_amount_val(config.get("onDemandCap")),
+        "on_demand_used": _parse_amount_val(config.get("onDemandUsed")),
+    }
+
+
+def _parse_xai_monthly_billing(config: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(config, dict):
+        return None
+    start = _parse_dt(config.get("billingPeriodStart"))
+    end = _parse_dt(config.get("billingPeriodEnd"))
+    if start is None or end is None or end <= start:
+        return None
+    limit = _parse_amount_val(config.get("monthlyLimit"))
+    used = _parse_amount_val(config.get("used"))
+    if limit is None or limit <= 0 or used is None:
+        return None
+    return {
+        "kind": "monthly",
+        "end": end,
+        "used": used,
+        "limit": limit,
+        "on_demand_cap": _parse_amount_val(config.get("onDemandCap")),
+        "on_demand_used": _parse_amount_val(config.get("onDemandUsed")),
+    }
+
+
+def _xai_confirms_no_monthly_quota(config: Any) -> bool:
+    if not isinstance(config, dict):
+        return False
+    limit = _parse_amount_val(config.get("monthlyLimit"))
+    if limit is not None:
+        return limit == 0
+    weekly = _parse_xai_weekly_billing(config)
+    return bool(weekly and weekly.get("inferred_percent"))
+
+
+def _xai_product_label(product: str) -> str:
+    if product == "GrokBuild":
+        return "Grok Build (Weekly)"
+    if product == "Api":
+        return "API (Weekly)"
+    return f"{product} (Weekly)"
+
+
+def _xai_on_demand_detail(cap: Optional[float], used: Optional[float]) -> Optional[str]:
+    if cap is None:
+        return None
+    spent = 0.0 if used is None else used
+    return f"On-demand: ${spent:,.2f} of ${cap:,.2f} used"
+
+
+def _xai_windows_from_billing(
+    *,
+    weekly: Optional[dict[str, Any]],
+    monthly: Optional[dict[str, Any]],
+) -> tuple[tuple[AccountUsageWindow, ...], tuple[str, ...]]:
+    windows: list[AccountUsageWindow] = []
+    details: list[str] = []
+    if weekly:
+        windows.append(
+            AccountUsageWindow(
+                label="Weekly",
+                used_percent=max(0.0, min(100.0, float(weekly["credit_usage_percent"]))),
+                reset_at=weekly["end"],
+            )
+        )
+        for product, percent in weekly["products"]:
+            windows.append(
+                AccountUsageWindow(
+                    label=_xai_product_label(product),
+                    used_percent=max(0.0, min(100.0, float(percent))),
+                    reset_at=weekly["end"],
+                )
+            )
+        detail = _xai_on_demand_detail(weekly.get("on_demand_cap"), weekly.get("on_demand_used"))
+        if detail:
+            details.append(detail)
+    if monthly:
+        used = float(monthly["used"])
+        limit = float(monthly["limit"])
+        used_percent = max(0.0, min(100.0, (used / limit) * 100.0))
+        windows.append(
+            AccountUsageWindow(
+                label="Monthly",
+                used_percent=used_percent,
+                reset_at=monthly["end"],
+            )
+        )
+        detail = _xai_on_demand_detail(monthly.get("on_demand_cap"), monthly.get("on_demand_used"))
+        if detail and detail not in details:
+            details.append(detail)
+    return tuple(windows), tuple(details)
+
+
+def _fetch_xai_billing_payload(url: str, token: str) -> Optional[dict[str, Any]]:
+    with httpx.Client(timeout=_USAGE_FETCH_TIMEOUT_SECONDS) as client:
+        response = client.get(url, headers=_xai_oauth_billing_headers(token))
+        response.raise_for_status()
+    try:
+        raw = response.json()
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _fetch_xai_oauth_account_usage_with_credentials(token: str) -> AccountUsageSnapshot:
+    """Fetch SuperGrok weekly/monthly quotas with an explicit OAuth bearer.
+
+    Raises on transport/HTTP errors so the pool path can isolate a rejected
+    credential. A 200 with an unusable body yields an unavailable snapshot
+    instead of crashing.
+    """
+    credits_payload = _fetch_xai_billing_payload(_XAI_OAUTH_BILLING_CREDITS_URL, token)
+    weekly = None
+    credits_config = credits_payload.get("config") if isinstance(credits_payload, dict) else None
+    if isinstance(credits_config, dict):
+        weekly = _parse_xai_weekly_billing(credits_config)
+    credits_looks_unified = isinstance(credits_config, dict) and credits_config.get("isUnifiedBillingUser") is True
+
+    monthly = None
+    monthly_config = None
+    should_probe_monthly = weekly is None or credits_looks_unified
+    if should_probe_monthly:
+        monthly_payload = _fetch_xai_billing_payload(_XAI_OAUTH_BILLING_MONTHLY_URL, token)
+        monthly_config = monthly_payload.get("config") if isinstance(monthly_payload, dict) else None
+        monthly = _parse_xai_monthly_billing(monthly_config)
+        # Unified accounts sometimes infer weekly 0% from a missing percent.
+        # Prefer a real monthly quota when one exists; keep weekly only when
+        # the monthly endpoint confirms there is no included quota.
+        if weekly and weekly.get("inferred_percent") and credits_looks_unified:
+            if monthly is not None:
+                weekly = None
+            elif not _xai_confirms_no_monthly_quota(monthly_config):
+                weekly = None
+
+    if weekly is None and monthly is None:
+        return AccountUsageSnapshot(
+            provider="xai-oauth",
+            source="usage_api",
+            fetched_at=_utc_now(),
+            unavailable_reason="The xAI usage service returned an unexpected response.",
+        )
+    windows, details = _xai_windows_from_billing(weekly=weekly, monthly=monthly)
+    return AccountUsageSnapshot(
+        provider="xai-oauth",
+        source="usage_api",
+        fetched_at=_utc_now(),
+        windows=windows,
+        details=details,
+    )
+
+
+def _fetch_xai_oauth_account_usage(*, api_key: Optional[str] = None) -> Optional[AccountUsageSnapshot]:
+    token = str(api_key or "").strip()
+    if not token:
+        raise RuntimeError("No xAI OAuth access token configured")
+    return _fetch_xai_oauth_account_usage_with_credentials(token)
+
+
+def _fetch_xai_oauth_singleton_usage_snapshot(*, fresh: bool) -> tuple[AccountUsageSnapshot, ...]:
+    """Compatibility fallback when no ``xai-oauth`` pool rows are visible.
+
+    Reads the auth.json singleton access token only — no refresh, no pool
+    load/select/peek, no persistence. Missing credentials → ``()``.
+    """
+    cache_key = "singleton"
+    if not fresh:
+        cached = _pool_usage_cache_get("xai-oauth", cache_key)
+        if cached is not None:
+            return (replace(cached, active=True),)
+        return ()
+    try:
+        from hermes_cli.auth import _read_xai_oauth_tokens
+
+        tokens = _read_xai_oauth_tokens()
+        token = str((tokens.get("tokens") or {}).get("access_token") or "").strip()
+    except Exception:
+        return ()
+    if not token:
+        return ()
+    try:
+        snapshot = _fetch_xai_oauth_account_usage_with_credentials(token)
+    except httpx.HTTPStatusError as exc:
+        snapshot = _unavailable_pool_snapshot(
+            "The stored OAuth credential was rejected."
+            if exc.response.status_code in {401, 403}
+            else "The xAI usage service is temporarily unavailable.",
+            provider="xai-oauth",
+        )
+    except Exception:
+        snapshot = _unavailable_pool_snapshot(
+            "The xAI usage service is temporarily unavailable.",
+            provider="xai-oauth",
+        )
+    _pool_usage_cache_put("xai-oauth", cache_key, snapshot)
+    return (replace(snapshot, active=True),)
+
+
+def _fetch_xai_oauth_pool_usage_snapshots(
+    *,
+    active_entry_id: Optional[str] = None,
+    fresh: bool = False,
+) -> tuple[AccountUsageSnapshot, ...]:
+    """Fetch SuperGrok usage for every visible ``xai-oauth`` pool row.
+
+    Same read-only contract as Codex/Go: raw ``read_credential_pool`` +
+    ``PooledCredential.from_dict``, no load/select/peek/refresh/persist.
+    Empty pool falls back to the auth.json singleton so classic single-login
+    setups still paint the status bar.
+    """
+    try:
+        from agent.credential_pool import PooledCredential
+
+        raw_rows = read_credential_pool("xai-oauth")
+        entries = [
+            PooledCredential.from_dict("xai-oauth", row)
+            for row in raw_rows
+            if isinstance(row, dict)
+        ]
+    except Exception:
+        entries = []
+
+    if not entries:
+        return _fetch_xai_oauth_singleton_usage_snapshot(fresh=fresh)
+
+    entries.sort(key=lambda entry: (int(entry.priority or 0), str(entry.id)))
+    known_ids = {entry.id for entry in entries}
+    effective_active_id = active_entry_id if active_entry_id in known_ids else None
+    if effective_active_id is None:
+        effective_active_id = next(
+            (entry.id for entry in entries if str(entry.runtime_api_key or "").strip()),
+            entries[0].id,
+        )
+
+    def fetch_entry(entry) -> Optional[AccountUsageSnapshot]:
+        if not fresh:
+            return _pool_usage_cache_get("xai-oauth", entry.id)
+        token = str(entry.runtime_api_key or "").strip()
+        if not token:
+            snapshot = _unavailable_pool_snapshot(
+                "No usable OAuth access token is stored for this account.",
+                provider="xai-oauth",
+            )
+        else:
+            try:
+                snapshot = _fetch_xai_oauth_account_usage_with_credentials(token)
+            except httpx.HTTPStatusError as exc:
+                snapshot = _unavailable_pool_snapshot(
+                    "The stored OAuth credential was rejected."
+                    if exc.response.status_code in {401, 403}
+                    else "The xAI usage service is temporarily unavailable.",
+                    provider="xai-oauth",
+                )
+            except Exception:
+                snapshot = _unavailable_pool_snapshot(
+                    "The xAI usage service is temporarily unavailable.",
+                    provider="xai-oauth",
+                )
+        _pool_usage_cache_put("xai-oauth", entry.id, snapshot)
+        return snapshot
+
+    try:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(entries))) as executor:
+            base_snapshots = list(executor.map(fetch_entry, entries))
+    except Exception:
+        base_snapshots = [fetch_entry(entry) for entry in entries]
+
+    pairs = [
+        (index, entry, snapshot)
+        for index, (entry, snapshot) in enumerate(zip(entries, base_snapshots), start=1)
+        if snapshot is not None
+    ]
+    return tuple(
+        replace(
+            snapshot,
+            credential_id=entry.id,
+            account_label=f"xAI {index}",
+            active=entry.id == effective_active_id,
+        )
+        for index, entry, snapshot in pairs
+    )
+
+
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -1112,6 +1478,8 @@ def fetch_account_usage(
             return _fetch_openrouter_account_usage(base_url, api_key)
         if normalized == "opencode-go":
             return _fetch_opencode_go_account_usage(base_url=base_url, api_key=api_key)
+        if normalized == "xai-oauth":
+            return _fetch_xai_oauth_account_usage(api_key=api_key)
     except Exception:
         return None
     return None
@@ -1434,11 +1802,19 @@ def fetch_pool_account_usage(
     NO pool rows are visible it falls back to the classic single env-backed
     account (``OPENCODE_GO_API_KEY``), so env-only setups keep working
     unchanged. ``fresh`` and the 60s cache behave identically to the Codex
-    entries.
+    entries. ``xai-oauth`` enumerates SuperGrok pool rows the same read-only
+    way and fetches each row's weekly/monthly billing from the Grok CLI
+    proxy. When NO pool rows are visible it falls back to the auth.json
+    singleton token.
     """
     normalized = str(provider or "").strip().lower()
     if normalized == "opencode-go":
         return _fetch_opencode_go_pool_usage_snapshots(
+            active_entry_id=active_entry_id,
+            fresh=fresh,
+        )
+    if normalized == "xai-oauth":
+        return _fetch_xai_oauth_pool_usage_snapshots(
             active_entry_id=active_entry_id,
             fresh=fresh,
         )
@@ -1532,15 +1908,14 @@ def fetch_pool_account_usage(
 # ``fetch_aggregate_account_usage`` is the read-only, all-provider surface for
 # explicit user commands (plugin /chatgpt-limits, /gptusage, CLI). It composes
 # the existing per-provider pool fetches and re-labels every snapshot with
-# SAFE display names: a persisted row's raw ``label`` is preserved ONLY when it
 # is a benign human-configured name (see ``is_safe_aggregate_account_label``);
 # anything email-shaped, env-var-shaped, token/JWT/UUID/hash-like, an internal
 # id, or otherwise non-benign falls back to a provider-prefixed ordinal
-# (``OpenAI-Codex-N`` / ``OpenCode-Go-N``). Account ids and tokens are never
+# (``OpenAI-Codex-N`` / ``OpenCode-Go-N`` / ``xAI-N``). Account ids and tokens are never
 # placed on the snapshots' display fields and the serializer already refuses
 # to emit ``credential_id``.
 
-_AGGREGATE_PROVIDERS = ("openai-codex", "opencode-go")
+_AGGREGATE_PROVIDERS = ("openai-codex", "opencode-go", "xai-oauth")
 
 # Conservative display-name pattern: printable ASCII word chars only, 1..48
 # chars, first char alphanumeric. No ``@``, no control characters, no
@@ -1631,9 +2006,9 @@ def _aggregate_display_label(raw: Any, *, provider: str, index: int, entry_id: O
 
     Preserves ``raw`` only when benign (and not the row's own internal id);
     otherwise falls back to a provider-prefixed ordinal: ``OpenAI-Codex-N`` for
-    ``openai-codex``, ``OpenCode-Go-N`` for ``opencode-go``, else a title-cased
-    provider prefix. ``index`` is the 1-based position among that provider's
-    accounts in priority order.
+    ``openai-codex``, ``OpenCode-Go-N`` for ``opencode-go``, ``xAI-N`` for
+    ``xai-oauth``, else a title-cased provider prefix. ``index`` is the 1-based
+    position among that provider's accounts in priority order.
     """
     if entry_id is not None and isinstance(raw, str) and raw == str(entry_id):
         raw = None  # never emit an internal credential id as a display name
@@ -1642,6 +2017,7 @@ def _aggregate_display_label(raw: Any, *, provider: str, index: int, entry_id: O
     prefix = {
         "openai-codex": "OpenAI-Codex",
         "opencode-go": "OpenCode-Go",
+        "xai-oauth": "xAI",
     }.get(provider, str(provider or "account").title())
     return f"{prefix}-{index}"
 
@@ -1761,6 +2137,16 @@ def fetch_aggregate_account_usage(
                         snapshot,
                         account_label=_aggregate_display_label(
                             None, provider="opencode-go", index=position
+                        ),
+                    )
+                )
+        elif provider == "xai-oauth":
+            for position, snapshot in enumerate(snapshots, start=1):
+                results.append(
+                    replace(
+                        snapshot,
+                        account_label=_aggregate_display_label(
+                            None, provider="xai-oauth", index=position
                         ),
                     )
                 )

@@ -262,7 +262,7 @@ class AggregateFetchTests(unittest.TestCase):
         snapshots = self._run(fake_fetch)
 
         self.assertEqual(
-            calls, [("openai-codex", True), ("opencode-go", True)]
+            calls, [("openai-codex", True), ("opencode-go", True), ("xai-oauth", True)]
         )
         self.assertEqual(
             [snapshot.account_label for snapshot in snapshots],
@@ -295,7 +295,9 @@ class AggregateFetchTests(unittest.TestCase):
         def fake_fetch(provider, *, fresh=False):
             if provider == "opencode-go":
                 raise RuntimeError("synthetic go failure")
-            return (_snapshot(credential_id="entry-a", active=True),)
+            if provider == "openai-codex":
+                return (_snapshot(credential_id="entry-a", active=True),)
+            return ()
 
         snapshots = self._run(fake_fetch)
 
@@ -365,7 +367,7 @@ class AggregateFetchTests(unittest.TestCase):
 
         self._run(fake_fetch, fresh=False)
         self._run(fake_fetch, fresh=True)
-        self.assertEqual(calls, [False, False, True, True])
+        self.assertEqual(calls, [False, False, False, True, True, True])
 
 
 if __name__ == "__main__":

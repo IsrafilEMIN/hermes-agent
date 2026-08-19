@@ -367,4 +367,34 @@ describe('/usage slash command', () => {
     expect(panel.mock.calls.filter(c => c[0] === 'Codex limits')).toHaveLength(0)
     expect(panel.mock.calls.filter(c => c[0] === 'OpenCode Go limits')).toHaveLength(1)
   })
+
+  it('shows only the xAI limits panel for an xAI-only payload', async () => {
+    const { panel, run } = buildCtx({
+      'session.usage': baseUsage({
+        accounts: [
+          {
+            active: true,
+            available: true,
+            label: 'xai-oauth-key-9f3c',
+            provider: 'xai-oauth',
+            windows: [
+              { label: 'Weekly', used_percent: 24, reset_human: 'in 2d' },
+              { label: 'Monthly', used_percent: 40 }
+            ]
+          }
+        ]
+      })
+    })
+
+    await run('')
+
+    const xaiSections = panel.mock.calls.find(c => c[0] === 'xAI limits')?.[1] as { text?: string }[]
+    const body = (xaiSections ?? []).map(s => s.text ?? '').join('\n')
+    expect(body).toContain('● xAI (active)')
+    expect(body).toContain('Weekly: 76% remaining (24% used) · resets in 2d')
+    expect(body).not.toContain('xai-oauth-key-9f3c')
+    expect(panel.mock.calls.filter(c => c[0] === 'Codex limits')).toHaveLength(0)
+    expect(panel.mock.calls.filter(c => c[0] === 'OpenCode Go limits')).toHaveLength(0)
+    expect(panel.mock.calls.filter(c => c[0] === 'xAI limits')).toHaveLength(1)
+  })
 })

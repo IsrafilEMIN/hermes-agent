@@ -113,3 +113,46 @@ export function openCodeGoUsageDetails(accounts: CodexUsageAccount[] | undefined
     return [`${marker} OpenCode Go${account.active ? ' (active)' : ''}`, ...lines]
   })
 }
+
+// ── xAI OAuth / SuperGrok (pool rows, read-only) ───────────────────────────
+
+const xaiWindow = (account: CodexUsageAccount | undefined, kind: 'weekly' | 'monthly') =>
+  (account?.windows ?? []).find(window => {
+    const label = String(window.label ?? '').toLowerCase()
+    return kind === 'weekly' ? label === 'weekly' : label === 'monthly'
+  })
+
+/**
+ * Compact status segment for SuperGrok accounts:
+ * `xAI ● <weekly>/<monthly> ○ <weekly>/<monthly>` remaining percentages —
+ * one persistent circle per account (`●` active / `○` inactive), `?` per
+ * missing window. Active row first. Never exposes account labels.
+ */
+export function formatXaiUsage(accounts: CodexUsageAccount[] | undefined): string {
+  const visible = (accounts ?? []).filter(account => account.provider === 'xai-oauth' || account.provider === 'xai')
+  if (!visible.length) return ''
+  const ordered = [...visible].sort((a, b) => Number(b.active ?? false) - Number(a.active ?? false))
+  const fmt = (value: number | null) => (value == null ? '?' : String(value))
+  const one = (account: CodexUsageAccount) =>
+    `${accountMarker(account)} ${fmt(remaining(xaiWindow(account, 'weekly')))}/${fmt(remaining(xaiWindow(account, 'monthly')))}`
+  return `xAI ${ordered.map(one).join(' ')}`
+}
+
+/** Detailed /usage block: `xAI` heading + weekly/monthly/product lines. */
+export function xaiUsageDetails(accounts: CodexUsageAccount[] | undefined): string[] {
+  return (accounts ?? []).flatMap(account => {
+    if (account.provider !== 'xai-oauth' && account.provider !== 'xai') return []
+    const marker = accountMarker(account)
+    const lines = (account.windows ?? []).map(window => {
+      const left = remaining(window)
+      const used =
+        typeof window.used_percent === 'number' ? Math.max(0, Math.min(100, Math.round(window.used_percent))) : null
+      const reset = window.reset_human ? ` · resets ${window.reset_human}` : window.detail ? ` · ${window.detail}` : ''
+      return `  ${window.label || 'Window'}: ${left == null ? 'unavailable' : `${left}% remaining (${used}% used)`}${reset}`
+    })
+    for (const detail of account.details ?? []) lines.push(`  ${detail}`)
+    if (account.unavailable_reason) lines.push(`  Unavailable: ${account.unavailable_reason}`)
+    return [`${marker} xAI${account.active ? ' (active)' : ''}`, ...lines]
+  })
+}
+

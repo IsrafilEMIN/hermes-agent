@@ -829,3 +829,95 @@ describe('StatusRule OpenCode Go segment', () => {
     expect(rendered).not.toContain('Codex')
   })
 })
+
+describe('StatusRule xAI SuperGrok segment', () => {
+  const xaiAccounts = [
+    {
+      active: true,
+      available: true,
+      label: 'xAI 1',
+      provider: 'xai-oauth',
+      windows: [
+        { label: 'Weekly', used_percent: 24, reset_human: 'in 2d' },
+        { label: 'Monthly', used_percent: 40 }
+      ]
+    }
+  ]
+
+  const allProviders = [
+    ...xaiAccounts,
+    {
+      active: true,
+      available: true,
+      label: 'Go 1',
+      provider: 'opencode-go',
+      windows: [
+        { label: 'Rolling 5h', used_percent: 10 },
+        { label: 'Weekly', used_percent: 41 },
+        { label: 'Monthly', used_percent: 47 }
+      ]
+    },
+    {
+      active: true,
+      available: true,
+      label: 'Codex 1',
+      provider: 'openai-codex',
+      windows: [
+        { label: 'Session', used_percent: 13 },
+        { label: 'Weekly', used_percent: 36 }
+      ]
+    }
+  ]
+
+  it('renders the full xAI weekly/monthly read-out pinned on wide and medium terminals', () => {
+    const wide = textContent(
+      StatusRule({ ...baseProps, cols: 120, usage: { ...baseProps.usage, accounts: [...xaiAccounts] } })
+    )
+    const medium = textContent(
+      StatusRule({ ...baseProps, cols: 80, usage: { ...baseProps.usage, accounts: [...xaiAccounts] } })
+    )
+    expect(wide).toContain('xAI ● 76/60')
+    expect(medium).toContain('xAI ● 76/60')
+  })
+
+  it('stays full-form on a narrow terminal', () => {
+    const rendered = textContent(
+      StatusRule({ ...baseProps, cols: 60, usage: { ...baseProps.usage, accounts: [...allProviders] } })
+    )
+    expect(rendered).toContain('xAI ● 76/60')
+  })
+
+  it('renders Codex then Go then xAI in fixed order regardless of payload order', () => {
+    const rendered = textContent(
+      StatusRule({ ...baseProps, cols: 160, usage: { ...baseProps.usage, accounts: [...allProviders] } })
+    )
+    expect(rendered).toContain('GPT ● 87/64')
+    expect(rendered).toContain('Go ● 90/59/53')
+    expect(rendered).toContain('xAI ● 76/60')
+    expect(rendered.indexOf('GPT ● 87/64')).toBeLessThan(rendered.indexOf('Go ● 90/59/53'))
+    expect(rendered.indexOf('Go ● 90/59/53')).toBeLessThan(rendered.indexOf('xAI ● 76/60'))
+  })
+
+  it('shows no xAI segment when the payload has no xai-oauth account', () => {
+    const noAccounts = textContent(StatusRule({ ...baseProps }))
+    const codexOnly = textContent(
+      StatusRule({
+        ...baseProps,
+        usage: { ...baseProps.usage, accounts: [...allProviders].filter(a => a.provider !== 'xai-oauth') }
+      })
+    )
+    expect(noAccounts).not.toContain('xAI ')
+    expect(codexOnly).not.toContain('xAI ')
+  })
+
+  it('renders only the xAI segment for an xAI-only payload', () => {
+    const rendered = textContent(
+      StatusRule({ ...baseProps, cols: 80, usage: { ...baseProps.usage, accounts: [...xaiAccounts] } })
+    )
+    expect(rendered).toContain('xAI ● 76/60')
+    expect(rendered).not.toContain('GPT')
+    expect(rendered).not.toContain('Go ')
+    expect(rendered).not.toContain('○')
+  })
+})
+

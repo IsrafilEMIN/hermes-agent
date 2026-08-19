@@ -999,3 +999,117 @@ def test_session_usage_rpc_aggregates_fresh_across_providers(monkeypatch):
         assert "credential_id" not in repr(result["accounts"])
     finally:
         _unregister_session("sid-aggregate")
+
+
+def _xai_snapshot(used_percent=24.0, *, credential_id="xai-cred"):
+    return account_usage.AccountUsageSnapshot(
+        provider="xai-oauth",
+        source="usage_api",
+        fetched_at=account_usage._utc_now(),
+        account_label="xAI 1",
+        active=True,
+        credential_id=credential_id,
+        windows=(account_usage.AccountUsageWindow("Weekly", used_percent=used_percent),),
+    )
+
+
+class XaiOauthUsagePayloadTests(unittest.TestCase):
+    """xAI OAuth current-provider behavior of ``_session_usage_snapshot``."""
+
+    @staticmethod
+    def _xai_agent():
+        return SimpleNamespace(provider="xai-oauth")
+
+    def _snapshot(self, agent, *, fresh=False, fetch, usage=None):
+        with mock.patch.object(
+            server, "_get_usage", lambda _agent: usage if usage is not None else {"calls": 1, "total": 10}
+        ), mock.patch.object(account_usage, "fetch_pool_account_usage", fetch):
+            return server._session_usage_snapshot({"agent": agent}, fresh=fresh)
+
+    def test_xai_parent_emits_safe_accounts_payload(self):
+        seen = {}
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            seen.update(provider=provider, active_entry_id=active_entry_id, fresh=fresh)
+            return (_xai_snapshot(),)
+
+        result = self._snapshot(self._xai_agent(), fetch=fake_fetch)
+
+        self.assertEqual(seen, {"provider": "xai-oauth", "active_entry_id": None, "fresh": False})
+        self.assertEqual(result["calls"], 1)
+        accounts = result["accounts"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["provider"], "xai-oauth")
+        self.assertEqual(accounts[0]["label"], "xAI 1")
+        self.assertTrue(accounts[0]["active"])
+        self.assertEqual(accounts[0]["windows"][0]["used_percent"], 24.0)
+        self.assertEqual(accounts[0]["windows"][0]["label"], "Weekly")
+        rendered = repr(accounts)
+        self.assertNotIn("credential_id", rendered)
+        self.assertNotIn("xai-cred", rendered)
+        self.assertNotIn("sk-", rendered)
+
+    def test_xai_fresh_flag_reaches_pool_fetch(self):
+        seen = {}
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            seen.update(provider=provider, fresh=fresh)
+            return ()
+
+        result = self._snapshot(self._xai_agent(), fresh=True, fetch=fake_fetch)
+        self.assertEqual(seen, {"provider": "xai-oauth", "fresh": True})
+        self.assertNotIn("accounts", result)
+
+    def test_xai_forwards_active_entry_id(self):
+        agent = SimpleNamespace(provider="xai-oauth", _credential_pool_entry_id="entry-x")
+        seen = {}
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            seen.update(provider=provider, active_entry_id=active_entry_id, fresh=fresh)
+            return (_xai_snapshot(),)
+
+        result = self._snapshot(agent, fetch=fake_fetch)
+        self.assertEqual(
+            seen,
+            {"provider": "xai-oauth", "active_entry_id": "entry-x", "fresh": False},
+        )
+        self.assertEqual(result["accounts"][0]["provider"], "xai-oauth")
+        self.assertTrue(result["accounts"][0]["active"])
+
+    def test_xai_parent_never_fetches_codex_or_go(self):
+        calls = []
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            calls.append((provider, active_entry_id, fresh))
+            return ()
+
+        self._snapshot(self._xai_agent(), fetch=fake_fetch)
+        self.assertEqual(calls, [("xai-oauth", None, False)])
+        self.assertNotIn("openai-codex", [call[0] for call in calls])
+        self.assertNotIn("opencode-go", [call[0] for call in calls])
+
+    def test_codex_parent_never_fetches_xai(self):
+        agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="entry-b")
+        calls = []
+
+        def fake_fetch(provider, *, active_entry_id=None, fresh=False):
+            calls.append((provider, active_entry_id, fresh))
+            return ()
+
+        self._snapshot(agent, fetch=fake_fetch)
+        self.assertEqual(calls, [("openai-codex", "entry-b", False)])
+        self.assertNotIn("xai-oauth", [call[0] for call in calls])
+
+    def test_xai_fetch_failure_is_fail_open_and_secret_free(self):
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("synthetic sk-secret-leak")
+
+        result = self._snapshot(
+            self._xai_agent(),
+            fetch=boom,
+            usage={"calls": 2, "total": 20},
+        )
+        self.assertEqual(result, {"calls": 2, "total": 20})
+        self.assertNotIn("accounts", result)
+        self.assertNotIn("sk-secret-leak", repr(result))
+

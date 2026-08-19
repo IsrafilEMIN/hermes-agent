@@ -1,7 +1,7 @@
 import { usageBarsText } from '../../../components/overlayPrimitives.js'
 import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
-import { codexUsageDetails, openCodeGoUsageDetails } from '../../../domain/usage.js'
+import { codexUsageDetails, openCodeGoUsageDetails, xaiUsageDetails } from '../../../domain/usage.js'
 import type {
   BackgroundStartResponse,
   ConfigGetValueResponse,
@@ -679,6 +679,7 @@ export const sessionCommands: SlashCommand[] = [
         // genuinely empty page — never next to rendered quota panels.
         const accountLines = codexUsageDetails(r?.accounts)
         const goLines = openCodeGoUsageDetails(r?.accounts)
+        const xaiLines = xaiUsageDetails(r?.accounts)
         let showedQuotaPanels = false
 
         if (accountLines.length) {
@@ -688,6 +689,11 @@ export const sessionCommands: SlashCommand[] = [
 
         if (goLines.length) {
           ctx.transcript.panel('OpenCode Go limits', [{ text: goLines.join('\n') }])
+          showedQuotaPanels = true
+        }
+
+        if (xaiLines.length) {
+          ctx.transcript.panel('xAI limits', [{ text: xaiLines.join('\n') }])
           showedQuotaPanels = true
         }
 

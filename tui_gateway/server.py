@@ -5631,8 +5631,8 @@ def _session_usage_snapshot(
         if aggregate:
             # Explicit /usage surface (`session.usage` RPC): every configured
             # account across the supported providers (openai-codex +
-            # opencode-go) regardless of the session's active provider — so the
-            # OpenCode Go account(s) sit alongside the Codex pool accounts.
+            # opencode-go + xai-oauth) regardless of the session's active
+            # provider — so SuperGrok and OpenCode Go sit alongside Codex.
             # Fail-open exactly like the provider-gated path below:
             # cosmetic quota telemetry must never break session.usage.
             try:
@@ -5693,6 +5693,24 @@ def _session_usage_snapshot(
             except Exception:
                 # Cosmetic quota telemetry must never break session.info/usage.
                 logger.debug("opencode-go account usage snapshot failed", exc_info=True)
+        if provider == "xai-oauth":
+            try:
+                from agent.account_usage import (
+                    account_usage_snapshot_to_dict,
+                    fetch_pool_account_usage,
+                )
+
+                snapshots = fetch_pool_account_usage(
+                    "xai-oauth",
+                    active_entry_id=getattr(agent, "_credential_pool_entry_id", None),
+                    fresh=fresh,
+                )
+                accounts.extend(
+                    account_usage_snapshot_to_dict(snapshot) for snapshot in snapshots
+                )
+            except Exception:
+                # Cosmetic quota telemetry must never break session.info/usage.
+                logger.debug("xai-oauth account usage snapshot failed", exc_info=True)
         if accounts:
             usage["accounts"] = accounts
         return usage
