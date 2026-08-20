@@ -35,6 +35,7 @@ import {
   normalizeSshConfig,
   normAuthMode
 } from './connection-config'
+import { matchingConnectionId, type StoredRoute } from './connection-route-identity'
 
 export const REGISTRY_VERSION = 2
 
@@ -76,6 +77,11 @@ export interface ConnectionRegistry {
   version: typeof REGISTRY_VERSION
   /** id of the connection that owns the window/primary backend. */
   primary: string
+  /** Which saved source Sessions should restore when the app launches. */
+  launchMode: 'last-used' | 'primary'
+  /** Last source the Sessions workspace successfully opened. Additive in v2
+   * so registries written before multi-source switching still normalize. */
+  lastUsed: string
   connections: RegistryConnection[]
 }
 
@@ -178,6 +184,173 @@ export interface RegistryLocalRoute {
   poolKey: string
 }
 
+export interface ResolvedConnectionSshDescriptor {
+  host?: string
+  keyPath?: string
+  port?: number
+  remoteHermesPath?: string
+  remoteProfile?: string
+  user?: string
+}
+
+export interface ResolvedConnectionDescriptor {
+  authMode?: unknown
+  baseUrl?: string
+  /** Property presence means this descriptor claims registry qualification.
+   * Invalid or retired claims fail closed; only descriptors with no such
+   * property may enter the legacy compatibility resolver. */
+  connectionId?: unknown
+  headers?: Record<string, unknown>
+  mode?: 'local' | 'remote'
+  org?: unknown
+  remoteHost?: string
+  remoteKind?: 'cloud' | 'ssh' | 'url'
+  ssh?: ResolvedConnectionSshDescriptor
+  token?: unknown
+}
+
+/**
+ * Recover registry identity for a descriptor resolved through the legacy v1
+ * profile path. Registry-scoped routes already carry `connectionId`; that
+ * exact identity is authoritative only while it names a current registry
+ * entry. Only genuinely unqualified descriptors may use compatibility
+ * inference, which keeps migrated per-profile remotes truthful until v1 is
+ * retired without letting malformed qualification fall through to a weaker
+ * endpoint-shaped identity.
+ */
+export function resolvedConnectionId(
+  registry: ConnectionRegistry,
+  descriptor: ResolvedConnectionDescriptor
+): null | string {
+  if (Object.prototype.hasOwnProperty.call(descriptor, 'connectionId')) {
+    const explicitConnectionId = descriptor.connectionId
+
+    // Presence is authoritative even when the value is unusable. Never turn
+    // a malformed, blank, unknown, or retired registry claim into permission
+    // to infer a different source from mutable endpoint metadata.
+    if (typeof explicitConnectionId !== 'string' || !explicitConnectionId.trim()) {
+      return null
+    }
+
+    return registry.connections.some(connection => connection.id === explicitConnectionId) ? explicitConnectionId : null
+  }
+
+  if (descriptor.mode === 'local') {
+    const localConnections = registry.connections.filter(connection => connection.kind === 'local')
+
+    return localConnections.length === 1 ? localConnections[0].id : null
+  }
+
+  if (descriptor.mode !== 'remote') {
+    return null
+  }
+
+  if (descriptor.remoteKind === 'ssh') {
+    if (Object.prototype.hasOwnProperty.call(descriptor, 'ssh')) {
+      if (!descriptor.ssh || typeof descriptor.ssh !== 'object') {
+        return null
+      }
+
+      return matchingConnectionId(registry, { ...descriptor.ssh, kind: 'ssh' }, 'unique') ?? null
+    }
+
+    // Old descriptors expose only user@host after the tunnel has discarded
+    // port/key/path/profile. That weak shape is compatible only when exactly
+    // one registered SSH source even shares the target, and the defaulted
+    // route still satisfies the canonical #88922 full-envelope matcher.
+    const ssh = normalizeSshConfig({ mode: 'ssh', host: descriptor.remoteHost })
+
+    if (!ssh) {
+      return null
+    }
+
+    const target = normalizedSshTarget(ssh)
+
+    const coarseMatches = registry.connections.filter(
+      connection => connection.kind === 'ssh' && normalizedSshTarget(connection) === target
+    )
+
+    if (!target || coarseMatches.length !== 1) {
+      return null
+    }
+
+    return matchingConnectionId(registry, { kind: 'ssh', ...ssh }, 'unique') ?? null
+  }
+
+  const kind = descriptor.remoteKind === 'cloud' ? 'cloud' : descriptor.remoteKind === 'url' ? 'remote' : null
+
+  if (!kind) {
+    return null
+  }
+
+  let url = ''
+
+  try {
+    url = normalizeRemoteBaseUrl(descriptor.baseUrl)
+  } catch {
+    return null
+  }
+
+  const authMode = normAuthMode(descriptor.authMode)
+
+  const route: StoredRoute = {
+    authMode,
+    headers: descriptor.headers,
+    kind,
+    org: descriptor.org,
+    token: descriptor.token,
+    url
+  }
+
+  const hasExactEnvelope =
+    Object.prototype.hasOwnProperty.call(descriptor, 'authMode') &&
+    Object.prototype.hasOwnProperty.call(descriptor, 'headers') &&
+    (authMode === 'oauth' || Object.prototype.hasOwnProperty.call(descriptor, 'token')) &&
+    (kind === 'remote' || Object.prototype.hasOwnProperty.call(descriptor, 'org'))
+
+  if (!hasExactEnvelope) {
+    // A URL alone cannot choose among legal registrations that differ by auth,
+    // headers, Cloud organization, or account. Require one coarse candidate
+    // before the same full-envelope matcher is allowed to accept the legacy
+    // defaults; otherwise zero/multiple candidates fail closed.
+    const coarseMatches = registry.connections.filter(connection => {
+      if (connection.kind !== kind) {
+        return false
+      }
+
+      try {
+        return normalizeRemoteBaseUrl(connection.url) === url
+      } catch {
+        return false
+      }
+    })
+
+    if (coarseMatches.length !== 1) {
+      return null
+    }
+  }
+
+  return matchingConnectionId(registry, route, 'unique') ?? null
+}
+
+function normalizedSshTarget(route: { host?: unknown; port?: unknown; user?: unknown }): null | string {
+  const ssh = normalizeSshConfig({ ...route, mode: 'ssh' })
+
+  if (!ssh) {
+    return null
+  }
+
+  const host = String(ssh.host || '')
+    .trim()
+    .toLowerCase()
+
+  const user = String(ssh.user || '')
+    .trim()
+    .toLowerCase()
+
+  return user ? `${user}@${host}` : host
+}
+
 /**
  * How the registry's 'local' entry resolves a backend for `profile`.
  *
@@ -255,16 +428,23 @@ export interface RosterAgent {
   connectionKind: ConnectionKind
   connectionLabel: string
   profile: string
+  /** Backend profile when the registry route maps the Desktop profile name. */
+  targetProfile?: string
   /** Bare profile name, or `<profile>-<label-slug>` when the profile name
    * exists on more than one registered source (the @name-device rule). */
   handle: string
 }
 
 /**
- * SSH roster enumeration skips undialed sources (connect-on-demand). Reuse the
- * last successful profile list so Bot Mode does not go empty the moment the
- * window switches back to local. Never-seen SSH sources still get a `default`
- * seed so the device is clickable.
+ * Roster enumeration skips undialed sources (connect-on-demand) and reports
+ * unreachable ones with `profiles: null`. Reuse the last successful profile
+ * list so Bot Mode does not go empty (or drop to a partial roster) the moment
+ * a source is briefly unreachable — SSH tunnels drop on sleep/wake, and a
+ * remote gateway bounce (VPS restart) otherwise erased its bots from the
+ * roster until the next successful enumeration ("my 4 bots show as 2", Aug
+ * 2026 bundle). Never-seen SSH sources still get a `default` seed so the
+ * device is clickable; never-seen remote sources stay empty (no seed) since
+ * an unreachable URL is not evidence a backend exists there.
  */
 export function rememberSshEnumeration(
   enumeration: Pick<ConnectionAgents, 'error' | 'profiles'>,
@@ -275,7 +455,7 @@ export function rememberSshEnumeration(
     return enumeration
   }
 
-  if (kind !== 'ssh') {
+  if (kind === 'local') {
     return enumeration
   }
 
@@ -283,7 +463,7 @@ export function rememberSshEnumeration(
     return { profiles: cached, error: enumeration.error }
   }
 
-  if (enumeration.error === 'connect-on-demand') {
+  if (kind === 'ssh' && enumeration.error === 'connect-on-demand') {
     return { profiles: ['default'], error: 'connect-on-demand' }
   }
 
@@ -403,6 +583,7 @@ export function buildAgentRoster(
       connectionKind: connection.kind,
       connectionLabel: connection.label,
       profile,
+      targetProfile: connection.remoteProfile || profile,
       handle: agentHandle(profile, connection.label, (counts.get(profile) || 0) > 1)
     })
   }
@@ -818,11 +999,15 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
     connections.unshift(localEntry())
   }
 
-  const primary = String(parsed.primary || '').trim()
+  const storedPrimary = String(parsed.primary || '').trim()
+  const primary = connections.some(c => c.id === storedPrimary) ? storedPrimary : LOCAL_CONNECTION_ID
+  const storedLastUsed = String(parsed.lastUsed || '').trim()
 
   return {
     version: REGISTRY_VERSION,
-    primary: connections.some(c => c.id === primary) ? primary : LOCAL_CONNECTION_ID,
+    primary,
+    launchMode: parsed.launchMode === 'last-used' ? 'last-used' : 'primary',
+    lastUsed: connections.some(c => c.id === storedLastUsed) ? storedLastUsed : primary,
     connections
   }
 }
@@ -967,7 +1152,7 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
     }
   }
 
-  return { version: REGISTRY_VERSION, primary, connections }
+  return { version: REGISTRY_VERSION, primary, launchMode: 'primary', lastUsed: primary, connections }
 }
 
 /** Insert or replace by id. Input must already be normalized/validated. */
@@ -994,9 +1179,12 @@ export function removeConnection(registry: ConnectionRegistry, id: string): Conn
     throw new Error('The local connection cannot be removed.')
   }
 
+  const primary = registry.primary === id ? LOCAL_CONNECTION_ID : registry.primary
+
   return {
     ...registry,
-    primary: registry.primary === id ? LOCAL_CONNECTION_ID : registry.primary,
+    primary,
+    lastUsed: registry.lastUsed === id ? primary : registry.lastUsed,
     connections: registry.connections.filter(c => c.id !== id)
   }
 }
@@ -1008,4 +1196,22 @@ export function setPrimaryConnection(registry: ConnectionRegistry, id: string): 
   }
 
   return { ...registry, primary: id }
+}
+
+/** Remember the last source the Sessions workspace opened successfully. */
+export function setLastUsedConnection(registry: ConnectionRegistry, id: string): ConnectionRegistry {
+  if (!registry.connections.some(c => c.id === id)) {
+    throw new Error(`No connection with id "${id}".`)
+  }
+
+  return { ...registry, lastUsed: id }
+}
+
+/** Choose whether launch restores the explicit primary or the last-used source. */
+export function setConnectionLaunchMode(registry: ConnectionRegistry, launchMode: string): ConnectionRegistry {
+  if (launchMode !== 'last-used' && launchMode !== 'primary') {
+    throw new Error(`Unknown connection launch mode "${String(launchMode)}".`)
+  }
+
+  return { ...registry, launchMode }
 }

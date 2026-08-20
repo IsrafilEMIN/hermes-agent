@@ -28,7 +28,10 @@ import {
   REGISTRY_VERSION,
   rememberSshEnumeration,
   removeConnection,
+  resolvedConnectionId,
   resolveRegistryLocalRoute,
+  setConnectionLaunchMode,
+  setLastUsedConnection,
   setPrimaryConnection,
   shouldDeferLocalEnumeration,
   shouldRetrySshInventory,
@@ -54,11 +57,343 @@ test('labelSlug kebab-cases and never returns empty for non-empty input', () => 
   assert.equal(labelSlug('!!!'), 'connection')
 })
 
+test('resolvedConnectionId identifies local and migrated remote descriptors', () => {
+  const registry = migrateV1ToRegistry({
+    mode: 'local',
+    profiles: {
+      personal: { mode: 'remote', url: 'https://personal.example:9443/', authMode: 'token' },
+      work: { mode: 'ssh', host: 'work-host', user: 'root' }
+    }
+  })
+
+  const personal = registry.connections.find(connection => connection.kind === 'remote')
+  const work = registry.connections.find(connection => connection.kind === 'ssh')
+
+  assert.equal(resolvedConnectionId(registry, { mode: 'local' }), LOCAL_CONNECTION_ID)
+  assert.equal(
+    resolvedConnectionId(registry, {
+      baseUrl: 'https://personal.example:9443',
+      mode: 'remote',
+      remoteKind: 'url'
+    }),
+    personal?.id
+  )
+  assert.equal(
+    resolvedConnectionId(registry, {
+      baseUrl: 'http://127.0.0.1:49152',
+      mode: 'remote',
+      remoteHost: 'ROOT@WORK-HOST',
+      remoteKind: 'ssh'
+    }),
+    work?.id
+  )
+
+  const ambiguousLocal: ConnectionRegistry = {
+    ...registry,
+    connections: [...registry.connections, { id: 'local-copy', kind: 'local', label: 'Local copy' }]
+  }
+
+  assert.equal(resolvedConnectionId(ambiguousLocal, { mode: 'local' }), null)
+})
+
+test('resolvedConnectionId does not guess an unregistered remote', () => {
+  assert.equal(
+    resolvedConnectionId(emptyRegistry(), {
+      baseUrl: 'https://unknown.example',
+      mode: 'remote',
+      remoteKind: 'url'
+    }),
+    null
+  )
+})
+
 test('agentHandle bare when unique, @name-device shape when duplicated', () => {
   assert.equal(agentHandle('research', 'Homelab', false), 'research')
   assert.equal(agentHandle('research', 'Homelab', true), 'research-homelab')
   assert.equal(agentHandle('research', 'Work Laptop', true), 'research-work-laptop')
   assert.equal(agentHandle('', 'Homelab', false), 'default')
+})
+
+test('resolvedConnectionId accepts only a current exact descriptor id and never falls back', () => {
+  const registry: ConnectionRegistry = {
+    version: REGISTRY_VERSION,
+    primary: 'remote-a',
+    launchMode: 'primary',
+    lastUsed: 'remote-a',
+    connections: [
+      { id: LOCAL_CONNECTION_ID, kind: 'local', label: 'This device' },
+      {
+        id: 'remote-a',
+        kind: 'remote',
+        label: 'Remote A',
+        url: 'https://shared.example',
+        authMode: 'token',
+        token: { encoding: 'safeStorage', value: 'token-a' },
+        headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-a' } }
+      },
+      {
+        id: 'remote-b',
+        kind: 'remote',
+        label: 'Remote B',
+        url: 'https://shared.example',
+        authMode: 'oauth',
+        headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-b' } }
+      }
+    ]
+  }
+
+  assert.equal(
+    resolvedConnectionId(registry, {
+      authMode: 'token',
+      baseUrl: 'https://shared.example',
+      connectionId: 'remote-b',
+      headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-a' } },
+      mode: 'remote',
+      remoteKind: 'url',
+      token: { encoding: 'safeStorage', value: 'token-a' }
+    }),
+    'remote-b'
+  )
+
+  const inferableRemoteA = {
+    authMode: 'token',
+    baseUrl: 'https://shared.example',
+    headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-a' } },
+    mode: 'remote' as const,
+    remoteKind: 'url' as const,
+    token: { encoding: 'safeStorage', value: 'token-a' }
+  }
+
+  // Only true absence enters compatibility inference. Every explicitly
+  // present invalid value remains unresolved even though the remaining
+  // envelope uniquely identifies remote-a.
+  assert.equal(resolvedConnectionId(registry, inferableRemoteA), 'remote-a')
+
+  for (const connectionId of ['', '   ', null, undefined, 42, {}, 'unknown-source', 'retired-source']) {
+    assert.equal(resolvedConnectionId(registry, { ...inferableRemoteA, connectionId }), null)
+  }
+
+  // Registry order is never authority for either an exact current id or a
+  // rejected explicit claim.
+  const reordered = { ...registry, connections: [...registry.connections].reverse() }
+
+  assert.equal(
+    resolvedConnectionId(reordered, {
+      ...inferableRemoteA,
+      connectionId: 'remote-b'
+    }),
+    'remote-b'
+  )
+  assert.equal(resolvedConnectionId(reordered, { ...inferableRemoteA, connectionId: 'retired-source' }), null)
+})
+
+test('resolvedConnectionId reuses the exact URL envelope and rejects weak or duplicate matches', () => {
+  const sharedUrl = 'https://shared.example/gateway'
+
+  const registry: ConnectionRegistry = {
+    version: REGISTRY_VERSION,
+    primary: 'remote-token',
+    launchMode: 'primary',
+    lastUsed: 'remote-token',
+    connections: [
+      { id: LOCAL_CONNECTION_ID, kind: 'local', label: 'This device' },
+      {
+        id: 'remote-token',
+        kind: 'remote',
+        label: 'Token remote',
+        url: sharedUrl,
+        authMode: 'token',
+        token: { encoding: 'safeStorage', value: 'token-a' },
+        headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-a' } }
+      },
+      {
+        id: 'remote-oauth',
+        kind: 'remote',
+        label: 'OAuth remote',
+        url: `${sharedUrl}/`,
+        authMode: 'oauth',
+        headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-b' } }
+      },
+      {
+        id: 'cloud-nous',
+        kind: 'cloud',
+        label: 'Nous cloud',
+        url: sharedUrl,
+        authMode: 'oauth',
+        headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-cloud' } },
+        org: 'nous'
+      },
+      {
+        id: 'cloud-labs',
+        kind: 'cloud',
+        label: 'Labs cloud',
+        url: sharedUrl,
+        authMode: 'oauth',
+        headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-cloud' } },
+        org: 'labs'
+      }
+    ]
+  }
+
+  assert.equal(
+    resolvedConnectionId(registry, {
+      authMode: 'token',
+      baseUrl: sharedUrl,
+      headers: { 'cf-access-client-id': { encoding: 'safeStorage', value: 'header-a' } },
+      mode: 'remote',
+      remoteKind: 'url',
+      token: { encoding: 'safeStorage', value: 'token-a' }
+    }),
+    'remote-token'
+  )
+  assert.equal(
+    resolvedConnectionId(registry, {
+      authMode: 'oauth',
+      baseUrl: sharedUrl,
+      headers: { 'CF-ACCESS-CLIENT-ID': { encoding: 'safeStorage', value: 'header-b' } },
+      mode: 'remote',
+      remoteKind: 'url'
+    }),
+    'remote-oauth'
+  )
+  assert.equal(
+    resolvedConnectionId(registry, {
+      authMode: 'oauth',
+      baseUrl: sharedUrl,
+      headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-cloud' } },
+      mode: 'remote',
+      org: 'nous',
+      remoteKind: 'cloud'
+    }),
+    'cloud-nous'
+  )
+  assert.equal(
+    resolvedConnectionId(registry, {
+      authMode: 'oauth',
+      baseUrl: sharedUrl,
+      headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-cloud' } },
+      mode: 'remote',
+      org: 'labs',
+      remoteKind: 'cloud'
+    }),
+    'cloud-labs'
+  )
+
+  // Post-dial URL-only shapes do not contain enough proof to choose a source.
+  assert.equal(resolvedConnectionId(registry, { baseUrl: sharedUrl, mode: 'remote', remoteKind: 'url' }), null)
+  assert.equal(resolvedConnectionId(registry, { baseUrl: sharedUrl, mode: 'remote', remoteKind: 'cloud' }), null)
+
+  // Even a complete envelope fails closed when two registrations are exact twins.
+  const duplicate: ConnectionRegistry = {
+    ...registry,
+    connections: [
+      ...registry.connections,
+      { ...registry.connections.find(connection => connection.id === 'remote-token')!, id: 'remote-token-copy' }
+    ]
+  }
+
+  assert.equal(
+    resolvedConnectionId(duplicate, {
+      authMode: 'token',
+      baseUrl: sharedUrl,
+      headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-a' } },
+      mode: 'remote',
+      remoteKind: 'url',
+      token: { encoding: 'safeStorage', value: 'token-a' }
+    }),
+    null
+  )
+  assert.equal(
+    resolvedConnectionId(
+      { ...duplicate, connections: [...duplicate.connections].reverse() },
+      {
+        authMode: 'token',
+        baseUrl: sharedUrl,
+        headers: { 'CF-Access-Client-Id': { encoding: 'safeStorage', value: 'header-a' } },
+        mode: 'remote',
+        remoteKind: 'url',
+        token: { encoding: 'safeStorage', value: 'token-a' }
+      }
+    ),
+    null
+  )
+})
+
+test('resolvedConnectionId keeps same-host SSH routes distinct by port, key, path, and profile', () => {
+  const base = {
+    host: 'work-host',
+    keyPath: '/keys/a',
+    kind: 'ssh' as const,
+    remoteHermesPath: '/srv/hermes',
+    remoteProfile: 'alpha',
+    user: 'root'
+  }
+
+  const registry: ConnectionRegistry = {
+    version: REGISTRY_VERSION,
+    primary: 'ssh-base',
+    launchMode: 'primary',
+    lastUsed: 'ssh-base',
+    connections: [
+      { id: LOCAL_CONNECTION_ID, kind: 'local', label: 'This device' },
+      { ...base, id: 'ssh-base', label: 'SSH base' },
+      { ...base, id: 'ssh-port', label: 'SSH port', port: 2222 },
+      { ...base, id: 'ssh-key', keyPath: '/keys/b', label: 'SSH key' },
+      { ...base, id: 'ssh-path', label: 'SSH path', remoteHermesPath: '/opt/hermes' },
+      { ...base, id: 'ssh-profile', label: 'SSH profile', remoteProfile: 'beta' }
+    ]
+  }
+
+  const resolve = (ssh: NonNullable<Parameters<typeof resolvedConnectionId>[1]['ssh']>) =>
+    resolvedConnectionId(registry, { mode: 'remote', remoteKind: 'ssh', ssh })
+
+  assert.equal(resolve(base), 'ssh-base')
+  assert.equal(resolve({ ...base, port: 2222 }), 'ssh-port')
+  assert.equal(resolve({ ...base, keyPath: '/keys/b' }), 'ssh-key')
+  assert.equal(resolve({ ...base, remoteHermesPath: '/opt/hermes' }), 'ssh-path')
+  assert.equal(resolve({ ...base, remoteProfile: 'beta' }), 'ssh-profile')
+  assert.equal(
+    resolvedConnectionId(registry, {
+      connectionId: 'ssh-port',
+      mode: 'remote',
+      remoteKind: 'ssh',
+      ssh: { ...base, port: 9999 }
+    }),
+    'ssh-port'
+  )
+
+  // user@host is a transport hint, not a registry identity, when variants coexist.
+  assert.equal(
+    resolvedConnectionId(registry, {
+      mode: 'remote',
+      remoteHost: 'ROOT@WORK-HOST',
+      remoteKind: 'ssh'
+    }),
+    null
+  )
+  assert.equal(
+    resolvedConnectionId(registry, {
+      mode: 'remote',
+      remoteHost: 'ROOT@WORK-HOST',
+      remoteKind: 'ssh',
+      ssh: undefined
+    }),
+    null
+  )
+
+  const duplicate: ConnectionRegistry = {
+    ...registry,
+    connections: [...registry.connections, { ...base, id: 'ssh-base-copy', label: 'SSH base copy' }]
+  }
+
+  assert.equal(resolvedConnectionId(duplicate, { mode: 'remote', remoteKind: 'ssh', ssh: base }), null)
+  assert.equal(
+    resolvedConnectionId(
+      { ...duplicate, connections: [...duplicate.connections].reverse() },
+      { mode: 'remote', remoteKind: 'ssh', ssh: base }
+    ),
+    null
+  )
 })
 
 test('connectionIdForLabel suffixes on collision and never mints "local"', () => {
@@ -222,6 +557,28 @@ test('rememberSshEnumeration: live list wins, cache then seed default', () => {
   assert.deepEqual(rememberSshEnumeration({ profiles: null, error: 'connect-on-demand' }, null, 'remote'), {
     profiles: null,
     error: 'connect-on-demand'
+  })
+})
+
+test('rememberSshEnumeration: a bounced remote source keeps its last-known roster (4-bots-show-as-2)', () => {
+  // A VPS restart makes the remote source unreachable for a few polls. The
+  // last successful enumeration must keep painting so the roster does not
+  // silently drop that source's bots mid-outage.
+  assert.deepEqual(
+    rememberSshEnumeration({ profiles: null, error: 'unreachable' }, ['default', 'ceo', 'accounter'], 'remote'),
+    { profiles: ['default', 'ceo', 'accounter'], error: 'unreachable' }
+  )
+  // Never-seen remote source: no seed — an unreachable URL is not evidence a
+  // backend exists there.
+  assert.deepEqual(rememberSshEnumeration({ profiles: null, error: 'unreachable' }, null, 'remote'), {
+    profiles: null,
+    error: 'unreachable'
+  })
+  // Local enumeration failures never reuse a cache (the local runtime answers
+  // authoritatively or not at all).
+  assert.deepEqual(rememberSshEnumeration({ profiles: null, error: 'boom' }, ['default'], 'local'), {
+    profiles: null,
+    error: 'boom'
   })
 })
 
@@ -644,6 +1001,8 @@ test('normalizeRegistry degrades junk to a local-only registry', () => {
 
     assert.equal(registry.version, REGISTRY_VERSION)
     assert.equal(registry.primary, LOCAL_CONNECTION_ID)
+    assert.equal(registry.launchMode, 'primary')
+    assert.equal(registry.lastUsed, LOCAL_CONNECTION_ID)
     assert.equal(registry.connections.length, 1)
     assert.equal(registry.connections[0].kind, 'local')
   }
@@ -675,6 +1034,8 @@ test('normalizeRegistry round-trips a valid registry unchanged in shape', () => 
   const input = {
     version: 2,
     primary: 'homelab',
+    launchMode: 'last-used',
+    lastUsed: 'homelab',
     connections: [
       { id: 'local', kind: 'local', label: 'This device' },
       {
@@ -700,6 +1061,8 @@ test('normalizeRegistry round-trips a valid registry unchanged in shape', () => 
   const registry = normalizeRegistry(input)
 
   assert.equal(registry.primary, 'homelab')
+  assert.equal(registry.launchMode, 'last-used')
+  assert.equal(registry.lastUsed, 'homelab')
   assert.equal(registry.connections.length, 4)
   assert.deepEqual(
     registry.connections.map(c => c.id),
@@ -707,6 +1070,22 @@ test('normalizeRegistry round-trips a valid registry unchanged in shape', () => 
   )
   assert.deepEqual(registry.connections[1].token, { v: 1 })
   assert.equal(registry.connections[3].port, 2222)
+})
+
+test('normalizeRegistry falls back to Primary when the last-used source is missing', () => {
+  const registry = normalizeRegistry({
+    version: 2,
+    primary: 'homelab',
+    launchMode: 'last-used',
+    lastUsed: 'retired-host',
+    connections: [
+      { id: 'local', kind: 'local', label: 'This device' },
+      { id: 'homelab', kind: 'remote', label: 'Homelab', url: 'http://10.0.0.5:9119' }
+    ]
+  })
+
+  assert.equal(registry.launchMode, 'last-used')
+  assert.equal(registry.lastUsed, 'homelab')
 })
 
 // --- v1 → v2 migration ---
@@ -793,17 +1172,19 @@ test('migrate: duplicate host labels are suffixed, not dropped', () => {
 
 // --- registry operations ---
 
-test('removeConnection: local refuses, primary retargets to local', () => {
+test('removeConnection: local refuses, primary and last-used retarget safely', () => {
   let registry = emptyRegistry()
   const entry = normalizeConnectionInput({ kind: 'remote', label: 'Homelab', url: 'http://10.0.0.5:9119' }, registry)
   registry = upsertConnection(registry, entry)
   registry = setPrimaryConnection(registry, entry.id)
+  registry = setLastUsedConnection(registry, entry.id)
 
   assert.throws(() => removeConnection(registry, LOCAL_CONNECTION_ID), /cannot be removed/)
 
   const after = removeConnection(registry, entry.id)
 
   assert.equal(after.primary, LOCAL_CONNECTION_ID)
+  assert.equal(after.lastUsed, LOCAL_CONNECTION_ID)
   assert.equal(after.connections.length, 1)
   // Removing an unknown id is a no-op, not an error.
   assert.equal(removeConnection(after, 'ghost'), after)
@@ -814,6 +1195,17 @@ test('setPrimaryConnection validates the target id', () => {
 
   assert.throws(() => setPrimaryConnection(registry, 'ghost'), /No connection/)
   assert.equal(setPrimaryConnection(registry, LOCAL_CONNECTION_ID).primary, LOCAL_CONNECTION_ID)
+})
+
+test('last-used source and launch mode validate their persisted values', () => {
+  let registry = emptyRegistry()
+  const entry = normalizeConnectionInput({ kind: 'remote', label: 'Homelab', url: 'http://10.0.0.5:9119' }, registry)
+  registry = upsertConnection(registry, entry)
+
+  assert.throws(() => setLastUsedConnection(registry, 'ghost'), /No connection/)
+  assert.equal(setLastUsedConnection(registry, entry.id).lastUsed, entry.id)
+  assert.equal(setConnectionLaunchMode(registry, 'last-used').launchMode, 'last-used')
+  assert.throws(() => setConnectionLaunchMode(registry, 'sometimes'), /Unknown connection launch mode/)
 })
 
 test('upsertConnection replaces by id and appends new ids', () => {
