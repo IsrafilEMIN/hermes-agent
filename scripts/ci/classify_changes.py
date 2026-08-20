@@ -42,6 +42,12 @@ must never skip one a change could break:
   only the flake reads them, so they skip the Python lanes and run ``nix``
   alone. ``pyproject.toml`` and ``uv.lock`` are flake inputs too, but the
   packaging tests read them, so they keep every Python lane.
+* ``website/static/oauth/`` is python-relevant too: it publishes the OAuth
+  Client ID Metadata Document that ``tests/tools/test_mcp_cimd.py`` checks
+  against the pinned callback ports in ``tools/mcp_oauth.py``.
+* ``website/docs/`` and ``website/scripts/`` are python-relevant for the same
+  reason: the docs tree generates ``llms.txt``, and
+  ``tests/website/test_generate_llms_txt.py`` asserts every page reaches it.
 """
 
 from __future__ import annotations
@@ -58,6 +64,21 @@ _NIX_FILES = {"flake.nix", "flake.lock"} # base nix files
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
+# Published artifacts that live under website/ but that Python asserts about.
+# The OAuth Client ID Metadata Document is cross-checked against the pinned
+# callback ports in tools/mcp_oauth.py, so editing it alone must still run the
+# Python lane — otherwise dropping a redirect URI goes green here and breaks
+# every CIMD login on main.
+# website/docs/ and website/scripts/ are asserted about the same way. The docs
+# tree generates llms.txt — the index every LLM (Hermes included, via the
+# hermes-agent skill) reads to learn what Hermes can do — and
+# tests/website/test_generate_llms_txt.py holds every page to appearing in it.
+# Skipping Python on a docs-only PR is how the index drifted to 53% coverage.
+_PY_RELEVANT_SITE = (
+    "website/static/oauth/",
+    "website/docs/",
+    "website/scripts/",
+)
 
 # CI-sensitive files: eslint config, workflow files, composite actions.
 # Changes here can influence what code the autofix job executes and pushes to
@@ -96,6 +117,8 @@ def _is_nix(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
+    if p.startswith(_PY_RELEVANT_SITE):
+        return False
     return (
         _is_docs(p)
         or p in _ROOT_NPM
