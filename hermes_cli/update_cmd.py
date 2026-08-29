@@ -3295,24 +3295,17 @@ def _sync_with_upstream_if_needed(
     assume_yes: bool = False,
     input_fn=None,
 ) -> bool:
-    """Check if fork is behind upstream and sync if safe.
+    """Sync a fork checkout onto upstream/main via the fork-aware updater.
 
-    This implements the fork upstream sync logic:
-    - If upstream remote doesn't exist, ask user if they want to add it
-    - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
-
-    Returns True when origin/main was actually verified against the official
-    upstream/main, False when the check never happened (prompt skipped or
-    declined, remote add failed, fetch or compare failed) so the caller can
-    avoid reporting the checkout as up to date on the strength of an origin
-    comparison alone (#97052 review).
+    Returns True when the checkout was actually verified against the official
+    upstream/main, False when the sync never happened (no upstream remote,
+    fetch or compare failed) so the caller can avoid reporting the checkout
+    as up to date on the strength of an origin comparison alone.
     """
-    has_upstream = _has_upstream_remote(git_cmd, cwd)
+    from hermes_cli.fork_update import run_fork_aware_update
 
+    has_upstream = _has_upstream_remote(git_cmd, cwd)
     if not has_upstream:
-        # Check if user previously declined
         if _should_skip_upstream_prompt():
             return False
 
@@ -3332,7 +3325,6 @@ def _sync_with_upstream_if_needed(
             )
             return False
 
-        # Ask user if they want to add upstream
         if input_fn is not None:
             response = (
                 input_fn("Add official repo as 'upstream' remote? [y/N]", "n")
@@ -3352,14 +3344,12 @@ def _sync_with_upstream_if_needed(
 
         if response in {"", "y", "yes"}:
             print("→ Adding upstream remote...")
-            if _add_upstream_remote(git_cmd, cwd):
-                print(
-                    "  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git"
-                )
-                has_upstream = True
-            else:
+            if not _add_upstream_remote(git_cmd, cwd):
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
                 return False
+            print(
+                "  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git"
+            )
         else:
             print(
                 "  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later."
@@ -3367,77 +3357,26 @@ def _sync_with_upstream_if_needed(
             _mark_skip_upstream_prompt()
             return False
 
-    # Fetch upstream main only. This sync compares upstream/main with
-    # origin/main, so there's no reason to pull every upstream ref — and a bare
-    # fetch drags in thousands of auto-generated branches.
-    print()
-    print("→ Fetching upstream...")
-    try:
-        subprocess.run(
-            git_cmd + ["fetch", "upstream", "main", "--quiet"],
-            cwd=cwd,
-            capture_output=True,
-            check=True,
-            **_no_prompt_git_kwargs(),
-        )
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return False
-
-    # Compare origin/main with upstream/main
-    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
-    upstream_ahead = _count_commits_between(
-        git_cmd, cwd, "origin/main", "upstream/main"
+    result = run_fork_aware_update(
+        source_root=cwd,
+        git_cmd=git_cmd,
+        branch="main",
+        assume_yes=assume_yes,
     )
-
-    if origin_ahead < 0 or upstream_ahead < 0:
-        print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return False
-
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
-        print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+    if result.report:
+        print(result.report)
+    if result.status in {"conflict", "error"}:
+        sys.exit(result.exit_code)
+    if result.status in {"updated", "up_to_date"}:
+        if _sync_fork_with_upstream(git_cmd, cwd):
+            print("  ✓ Fork synced with origin")
+        else:
+            print(
+                "  ℹ Rebased onto upstream but could not push to origin "
+                "(no write access?)"
+            )
         return True
-
-    # If upstream is not ahead, fork is up to date
-    if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
-        return True
-
-    # origin/main is strictly behind upstream/main (can fast-forward)
-    print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
-
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-            **_no_prompt_git_kwargs(),
-        )
-    except subprocess.CalledProcessError:
-        print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
-        )
-        return False
-
-    print("  ✓ Updated from upstream")
-
-    # Try to sync fork back to origin
-    print("→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd):
-        print("  ✓ Fork synced with upstream")
-    else:
-        print(
-            "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
-        )
-        print("    Your local repo is updated, but your fork on GitHub may be behind.")
-    return True
+    return False
 
 def _invalidate_update_cache():
     """Delete the update-check cache for ALL profiles so no banner
@@ -8185,8 +8124,15 @@ def _drain_or_signal_gateway_for_update(
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
-    """Body of ``cmd_update`` — kept separate so the wrapper can always
-    restore stdio even on ``sys.exit``."""
+    from hermes_cli.fork_update import resolve_source_root, restart_managed_backend
+    from hermes_constants import get_hermes_home as _get_hermes_home_for_update
+
+    _resolved_source = resolve_source_root(_m().PROJECT_ROOT)
+    if _resolved_source != _m().PROJECT_ROOT:
+        print(f"→ Source checkout: {_resolved_source}")
+        print(f"  Runtime state remains: {_get_hermes_home_for_update()}")
+        _m().PROJECT_ROOT = _resolved_source
+
     # A managed-runtime refresh can replace site-packages before the normal
     # ``.[all]`` install runs. Snapshot while the old environment can still
     # prove which optional backends the user had activated.
@@ -8841,6 +8787,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Non-fork checkouts have no upstream question: origin IS the official
         # repo, so "Already up to date!" is fully verified there.
         upstream_checked = True
+        fork_synced = False
         if commit_count == 0 and is_fork and branch == "main":
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             upstream_checked = _m()._sync_with_upstream_if_needed(
@@ -8850,6 +8797,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 input_fn=gw_input_fn,
             )
             post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            fork_synced = True
+            fork_head_moved = bool(pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha)
             if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
                 synced_count = _count_commits_between(
                     git_cmd,
@@ -9089,12 +9038,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # `merge --ff-only origin/<branch>` is byte-identical in effect to
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
-            pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
+            if fork_synced:
+                print("→ Fork already rebased onto upstream; skipping origin fast-forward")
+                pull_result = subprocess.CompletedProcess(
+                    args=git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+            else:
+                pull_result = subprocess.run(
+                    git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged. Before
                 # assuming an upstream force-push, check WHY: a checkout on a
@@ -9381,14 +9339,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._record_bytecode_fingerprint()
         _m()._refresh_bootstrap_cache_scripts(branch)
 
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                assume_yes=assume_yes,
-                input_fn=gw_input_fn,
-            )
+        if is_fork and branch == "main" and not fork_synced:
+            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -10429,6 +10381,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
                 except (FileNotFoundError, ImportError):
                     pass
+
+            try:
+                restart_managed_backend(source_root=_m().PROJECT_ROOT)
+            except Exception as exc:
+                print(f"  ⚠ managed backend restart failed: {exc}")
 
             # --- Manual (non-service) gateways ---
             # Kill any remaining gateway processes not managed by a service.

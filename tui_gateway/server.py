@@ -7680,10 +7680,44 @@ def _session_usage_snapshot(session: dict | None) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
-        return dict(mirror_usage)
-    if agent is not None:
-        return _get_usage(agent)
-    return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+        usage = dict(mirror_usage)
+    elif agent is not None:
+        usage = dict(_get_usage(agent))
+    else:
+        usage = dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+    _attach_status_quota(session, agent, usage)
+    return usage
+
+
+def _attach_status_quota(session: dict | None, agent, usage: dict) -> None:
+    if agent is None or not isinstance(usage, dict):
+        return
+    provider = str(getattr(agent, "provider", "") or "").strip()
+    if not provider:
+        usage["quota"] = []
+        return
+    try:
+        from agent.account_usage import get_cached_status_quota, schedule_status_quota_refresh
+    except Exception:
+        return
+    try:
+        usage["quota"] = list(get_cached_status_quota(provider) or [])
+        sid = str((session or {}).get("session_key") or "")
+        api_key = getattr(agent, "api_key", None)
+        base_url = getattr(agent, "api_base", None) or getattr(agent, "base_url", None)
+
+        def _on_done(accounts, _sid=sid):
+            if _sid:
+                _emit("session.usage", _sid, {"usage": {"quota": list(accounts or [])}})
+
+        schedule_status_quota_refresh(
+            provider,
+            api_key=api_key,
+            base_url=base_url,
+            on_done=_on_done,
+        )
+    except Exception:
+        logger.debug("status quota attach failed", exc_info=True)
 
 
 def _project_info_for_cwd(cwd: str) -> dict | None:

@@ -2,7 +2,13 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { dashboardFallbackArgs, serveBackendArgs, sourceDeclaresServe } from './backend-command'
+import {
+  dashboardFallbackArgs,
+  SAFEHOUSE_SERVE_PORT,
+  safehouseServeBackendArgs,
+  serveBackendArgs,
+  sourceDeclaresServe
+} from './backend-command'
 
 test('serveBackendArgs builds a headless serve invocation', () => {
   assert.deepEqual(serveBackendArgs(), ['serve', '--host', '127.0.0.1', '--port', '0'])
@@ -10,6 +16,25 @@ test('serveBackendArgs builds a headless serve invocation', () => {
 
 test('serveBackendArgs pins a profile when provided', () => {
   assert.deepEqual(serveBackendArgs('worker'), ['--profile', 'worker', 'serve', '--host', '127.0.0.1', '--port', '0'])
+})
+
+test('safehouseServeBackendArgs uses the fixed Safehouse localhost contract', () => {
+  assert.deepEqual(safehouseServeBackendArgs(), [
+    'serve',
+    '--host',
+    '127.0.0.1',
+    '--port',
+    String(SAFEHOUSE_SERVE_PORT)
+  ])
+  assert.deepEqual(safehouseServeBackendArgs('worker'), [
+    '--profile',
+    'worker',
+    'serve',
+    '--host',
+    '127.0.0.1',
+    '--port',
+    '8642'
+  ])
 })
 
 test('dashboardFallbackArgs rewrites serve -> dashboard --no-open, keeping the -m prefix', () => {

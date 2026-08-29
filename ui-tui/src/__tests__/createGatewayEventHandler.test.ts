@@ -2077,17 +2077,30 @@ describe('createGatewayEventHandler', () => {
       expect(getUiState().usage).toMatchObject({ context_percent: 42, input: 1200, total: 1280 })
     })
 
-    it('keeps existing usage fields when the tick only carries a subset', () => {
-      patchUiState({ sid: 'sess-1', usage: { calls: 2, input: 500, output: 40, total: 540 } })
+    it('sets usage.quota from a session.usage patch and keeps it on later quota-less ticks', () => {
+      patchUiState({ sid: 'sess-1' })
       const onEvent = createGatewayEventHandler(buildCtx([]))
+      const quota = [{ provider: 'opencode-go', active: true, five_hour: 25, seven_day: 60, monthly: 35 }]
 
-      onEvent({
-        payload: { usage: { context_percent: 55 } },
-        session_id: 'sess-1',
-        type: 'session.usage'
-      } as any)
+      onEvent({ payload: { usage: { ...ZERO, quota } }, session_id: 'sess-1', type: 'session.usage' })
 
-      expect(getUiState().usage).toMatchObject({ context_percent: 55, input: 500, total: 540 })
+      expect(getUiState().usage.quota).toEqual(quota)
+
+      onEvent({ payload: { usage: { ...ZERO, input: 1, total: 1 } }, session_id: 'sess-1', type: 'session.usage' })
+
+      expect(getUiState().usage.quota).toEqual(quota)
+      expect(getUiState().usage.input).toBe(1)
+    })
+
+    it('clears usage.quota when a session.usage patch sends an empty array', () => {
+      patchUiState({ sid: 'sess-1' })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+      const quota = [{ provider: 'openai-codex', active: true, five_hour: 24, seven_day: 8 }]
+
+      onEvent({ payload: { usage: { ...ZERO, quota } }, session_id: 'sess-1', type: 'session.usage' })
+      onEvent({ payload: { usage: { quota: [] } }, session_id: 'sess-1', type: 'session.usage' })
+
+      expect(getUiState().usage.quota).toEqual([])
     })
 
     it('drops a tick for a non-focused session', () => {

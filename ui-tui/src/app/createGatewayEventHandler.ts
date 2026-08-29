@@ -48,11 +48,31 @@ const normalizeVoiceSubmitMode = (value: unknown): VoiceSubmitMode =>
 // iterates the union of keys generically so a future Usage field (e.g.
 // active_subagents, consumed by the status rule's subagent segment) can never
 // be silently dropped from the comparison.
+const stableStringify = (value: unknown): string | undefined => {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value)
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`
+  }
+
+  const entries = Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map(key => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`)
+
+  return `{${entries.join(',')}}`
+}
+
 export const usageChanged = (prev: Usage, next: Usage): boolean => {
   const keys = new Set([...Object.keys(prev), ...Object.keys(next)]) as Set<keyof Usage>
 
   for (const key of keys) {
-    if (prev[key] !== next[key]) {
+    if (key === 'quota') {
+      if (stableStringify(prev.quota) !== stableStringify(next.quota)) {
+        return true
+      }
+    } else if (prev[key] !== next[key]) {
       return true
     }
   }

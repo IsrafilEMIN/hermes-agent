@@ -62,4 +62,37 @@ function isOfficialSshRemote(url) {
   return isSshRemote(url) && canonicalGitHubRemote(url) === OFFICIAL_REPO_CANONICAL
 }
 
-export { canonicalGitHubRemote, isOfficialSshRemote, isSshRemote, OFFICIAL_REPO_CANONICAL, OFFICIAL_REPO_HTTPS_URL }
+/**
+ * Pick the remote Desktop should compare against. Matches CLI
+ * `hermes update --check`: on `main`, prefer `upstream` when that remote
+ * exists so a fork that is current with origin still sees official commits.
+ * Non-main branches stay on origin — a fork's `bb/gui` typically has no
+ * upstream counterpart.
+ */
+function resolveUpdateCompareRemote({
+  branch,
+  originUrl,
+  upstreamUrl
+}: {
+  branch: string
+  originUrl?: string
+  upstreamUrl?: string
+}): { remote: 'origin' | 'upstream'; compareUrl: string } {
+  const origin = String(originUrl || '').trim()
+  const upstream = String(upstreamUrl || '').trim()
+
+  if (branch === 'main' && upstream) {
+    return { remote: 'upstream', compareUrl: upstream }
+  }
+
+  return { remote: 'origin', compareUrl: origin }
+}
+
+export {
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  isSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveUpdateCompareRemote
+}

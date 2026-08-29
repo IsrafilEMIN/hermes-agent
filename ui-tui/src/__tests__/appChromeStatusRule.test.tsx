@@ -128,6 +128,36 @@ describe('StatusRule session title', () => {
   })
 })
 
+describe('StatusRule remaining quota', () => {
+  it('renders the remaining-quota chip before the context bar', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: {
+        ...baseProps.usage,
+        quota: [
+          { provider: 'openai-codex', active: true, five_hour: 24, seven_day: 8 },
+          { provider: 'openai-codex', active: false, five_hour: 66 }
+        ]
+      }
+    })
+
+    const rendered = textContent(element)
+    expect(rendered).toContain('GPT ● 76/92 ○ 34/?')
+    const chipAt = rendered.indexOf('GPT ● 76/92 ○ 34/?')
+    const barAt = rendered.indexOf('[')
+    expect(barAt).toBeGreaterThan(chipAt)
+  })
+
+  it('hides the quota chip when usage.quota is empty', () => {
+    const element = StatusRule({
+      ...baseProps,
+      usage: { ...baseProps.usage, quota: [] }
+    })
+
+    expect(textContent(element)).not.toContain('●')
+  })
+})
+
 describe('StatusRule background-subagent indicator', () => {
   it('renders ⛓ N on a wide terminal when subagents are running', () => {
     const element = StatusRule({

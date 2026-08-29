@@ -109,9 +109,14 @@ class TestUpstreamPromptNonInteractive:
 
     def test_interactive_accept_adds_upstream(self, fork_without_upstream):
         fork_without_upstream.stdin_input.return_value = "y"
-        with patch.object(
-            update_cmd, "_count_commits_between", return_value=-1
-        ), patch.object(update_cmd.subprocess, "run"):
+        with patch(
+            "hermes_cli.fork_update.run_fork_aware_update",
+            return_value=SimpleNamespace(
+                status="up_to_date", exit_code=0, report=""
+            ),
+        ) as run_fork_update, patch.object(
+            update_cmd, "_sync_fork_with_upstream", return_value=True
+        ):
             p_in, p_out = _tty(True, True)
             with p_in, p_out:
                 update_cmd._sync_with_upstream_if_needed(
@@ -122,3 +127,9 @@ class TestUpstreamPromptNonInteractive:
             ["git"], fork_without_upstream.cwd
         )
         fork_without_upstream.mark_skip.assert_not_called()
+        run_fork_update.assert_called_once_with(
+            source_root=fork_without_upstream.cwd,
+            git_cmd=["git"],
+            branch="main",
+            assume_yes=False,
+        )

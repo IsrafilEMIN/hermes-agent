@@ -208,6 +208,15 @@ export interface SessionInfo {
   version?: string
 }
 
+export interface UsageQuotaAccount {
+  provider: string
+  active: boolean
+  five_hour?: number
+  seven_day?: number
+  monthly?: number
+  monthly_other?: number
+}
+
 export interface Usage {
   active_subagents?: number
   /** Rolling mean API latency over the last 10 calls (seconds). */
@@ -226,6 +235,7 @@ export interface Usage {
   dev_credits_spent_micros?: number
   input: number
   output: number
+  quota?: UsageQuotaAccount[] | null
   reasoning?: number
   total: number
 }

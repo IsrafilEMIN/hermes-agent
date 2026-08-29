@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEST="${1:-${HERMES_SOURCE_ROOT:-$HOME/Developer/harness/hermes-agent}}"
+if [[ "$ROOT" -ef "$DEST" ]]; then
+  printf '%s\n' "already at $DEST"
+  exit 0
+fi
+if [[ -d "$DEST/.git" ]]; then
+  printf '%s\n' "preserving existing harness checkout at $DEST"
+  exit 0
+fi
+if [[ -e "$DEST" ]]; then
+  printf '%s\n' "refusing to overwrite non-git path $DEST" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$DEST")"
+ditto "$ROOT" "$DEST"
+(
+  cd "$DEST"
+  git sparse-checkout disable >/dev/null 2>&1 || true
+  git remote get-url origin >/dev/null 2>&1 || git remote add origin https://github.com/IsrafilEMIN/hermes-agent.git
+  git remote get-url upstream >/dev/null 2>&1 || git remote add upstream https://github.com/NousResearch/hermes-agent.git
+)
+printf '%s\n' "copied $ROOT -> $DEST"

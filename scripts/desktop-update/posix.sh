@@ -10,7 +10,7 @@
 #
 # CONTRACT (keep in sync with apps/desktop/electron/main.ts):
 #   bash scripts/desktop-update/posix.sh
-#     --install-root <path>    repo checkout (HERMES_HOME/hermes-agent)
+#     --install-root <path>    source checkout (default: ~/Developer/harness/hermes-agent)
 #     --branch <ref>           branch to update against
 #     --desktop-pid <pid>      the Electron main process to wait out
 #     [--relaunch-target <p>]  mac: running .app to swap+reopen;
@@ -60,11 +60,33 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 64 ;;
   esac
 done
-[ "$SELF_TEST_UI" -eq 1 ] || [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
+HARNESS_SOURCE="${HERMES_SOURCE_ROOT:-$HOME/Developer/harness/hermes-agent}"
+is_runtime_or_global_source() {
+  case "$1" in
+    ""|"$HOME/.hermes"|"$HOME/.hermes/"*|*/.hermes/hermes-agent|*/.local/*) return 0 ;;
+  esac
+  return 1
+}
+if [ "$SELF_TEST_UI" -ne 1 ] && [ "$SELF_TEST_GATE" -ne 1 ]; then
+  if [ -z "$INSTALL_ROOT" ] || is_runtime_or_global_source "$INSTALL_ROOT"; then
+    if [ -d "$HARNESS_SOURCE/.git" ]; then
+      INSTALL_ROOT="$HARNESS_SOURCE"
+    elif [ -z "$INSTALL_ROOT" ]; then
+      echo "--install-root is required (harness checkout not found at $HARNESS_SOURCE)" >&2
+      exit 64
+    fi
+  fi
+  [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HERMES_HOME="${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}"
-HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
+if [ "$SELF_TEST_MARKER" -eq 1 ]; then
+  HERMES_HOME="$(dirname "$INSTALL_ROOT")"
+elif [ -z "${HERMES_HOME:-}" ]; then
+  HERMES_HOME="$HOME/.hermes"
+fi
+export HERMES_HOME
+export HERMES_SOURCE_ROOT="${HERMES_SOURCE_ROOT:-$INSTALL_ROOT}"
 MARKER="$HERMES_HOME/.hermes-update-in-progress"
 LOG_DIR="$HERMES_HOME/logs"; mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG="$LOG_DIR/desktop-update-handoff.log"
@@ -711,8 +733,9 @@ fi
 sleep 1
 start_ui
 
+UPDATE_BIN="$INSTALL_ROOT/scripts/fork-update"
+[ -x "$UPDATE_BIN" ] || { FINAL_CODE=3 FINAL_MSG="Update aborted: $UPDATE_BIN is missing."; log "$FINAL_MSG"; exit 3; }
 HERMES_BIN="$INSTALL_ROOT/venv/bin/hermes"
-[ -x "$HERMES_BIN" ] || { FINAL_CODE=3 FINAL_MSG="Update aborted: $HERMES_BIN is missing. The install needs repair (run the Hermes installer or hermes doctor)."; log "$FINAL_MSG"; exit 3; }
 
 # Heal a venv the reverted TCC anchor left bricked BEFORE invoking the CLI:
 # venv/bin/hermes execs venv/bin/python3, so a dead alias kills every attempt
@@ -731,34 +754,26 @@ if [ "${UPDATE_INVOKE[0]}" != "$HERMES_BIN" ]; then
   log "venv/bin/python3 still unbootable; invoking the update via ${UPDATE_INVOKE[*]}"
 fi
 
-# Run FROM the install root: `hermes update` resolves the tree it mutates
+# Run FROM the source root: the fork updater resolves the tree it mutates
 # from the working directory, and we inherit the Desktop's cwd (which can be
 # an unrelated repo — updating THAT instead of the install is the failure
 # the sandbox repro caught). FAIL CLOSED: set -u without set -e means a
 # failed cd would otherwise continue in the wrong tree — the exact class
 # this correction exists to eliminate.
 cd "$INSTALL_ROOT" || {
-  FINAL_CODE=3 FINAL_MSG="Update aborted: cannot enter the install root ($INSTALL_ROOT). Nothing was changed."
+  FINAL_CODE=3 FINAL_MSG="Update aborted: cannot enter the source checkout ($INSTALL_ROOT). Nothing was changed."
   log "$FINAL_MSG"; exit 3
 }
 export PYTHONUNBUFFERED=1
-# --keep-stash: never re-apply local source edits after the update (they stay
-# parked in git stash). Probe --help first: older installed backends don't
-# know the flag and argparse would abort with exit 2, which collides with the
-# "close all Hermes windows" sentinel.
-KEEP_STASH=""
-if "${UPDATE_INVOKE[@]}" update --help 2>/dev/null | grep -q -- '--keep-stash'; then
-  KEEP_STASH="--keep-stash"
-else
-  log "installed hermes predates --keep-stash; running without it"
-fi
-log "running: ${UPDATE_INVOKE[*]} update --yes --gateway $KEEP_STASH --branch $BRANCH"
+export HERMES_SOURCE_ROOT="$INSTALL_ROOT"
+export HERMES_HOME
+log "running: $UPDATE_BIN --yes --no-desktop-build --branch $BRANCH (source=$INSTALL_ROOT runtime=$HERMES_HOME)"
 publish_stage "Updating code and dependencies"
-OUT="$("${UPDATE_INVOKE[@]}" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
+OUT="$("$UPDATE_BIN" --yes --no-desktop-build --branch "$BRANCH" 2>&1)"; CODE=$?
 printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
 log "hermes update exit code: $CODE"
 
-if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
+if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ] && [ "$CODE" -ne 8 ] && [ "$CODE" -ne 9 ]; then
   # Retry once: update-boundary class (fresh code on disk, stale in memory).
   # Exit 2 ("close all Hermes windows") is not retryable.
   #
@@ -776,17 +791,14 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
   fi
   log "retrying once (freshly pulled fix loads on the second run)"
   publish_stage "Retrying update"
-  OUT="$("${UPDATE_INVOKE[@]}" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
+  OUT="$("$UPDATE_BIN" --yes --no-desktop-build --branch "$BRANCH" 2>&1)"; CODE=$?
   printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
   log "retry exit code: $CODE"
 fi
 trap 'on_signal TERM' TERM
 
-# Truthful completion: `hermes update` calls a GUI build failure non-fatal
-# (exit 0). For a Desktop-driven update that would relaunch the OLD build
-# and call it success -- retry the build once, propagate honestly.
-if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; then
-  log "desktop build failed inside hermes update; retrying build"
+if [ "$CODE" -eq 0 ]; then
+  log "rebuilding Desktop from harness checkout"
   publish_stage "Rebuilding Desktop"
   "${UPDATE_INVOKE[@]}" desktop --force-build --build-only >> "$LOG" 2>&1 || {
     FINAL_CODE=6 FINAL_MSG="Code and dependencies updated, but the Desktop app rebuild failed - you are running the previous build. Run hermes desktop --force-build from a terminal to retry."
@@ -794,12 +806,17 @@ if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; the
   }
 fi
 
-if [ "$CODE" -eq 0 ]; then FINAL_CODE=0 FINAL_MSG="Update complete."
+if [ "$CODE" -eq 0 ]; then
+  publish_stage "Restarting backend"
+  if [ -x "$INSTALL_ROOT/scripts/restart-managed-backend" ]; then
+    "$INSTALL_ROOT/scripts/restart-managed-backend" >> "$LOG" 2>&1 || log "WARNING: managed backend restart failed"
+  fi
+  FINAL_CODE=0 FINAL_MSG="Update complete."
 else
-  FINAL_CODE="$CODE" FINAL_MSG="Update failed (exit $CODE). Run hermes debug share in a terminal to send a report."
-  # The bricked-venv class is fixable and must not read as a generic exit 1:
-  # a dead interpreter with a failed/impossible heal means retrying can never
-  # succeed — tell the user what is actually wrong (#95759).
+  FAIL_TAIL="$(printf '%s\n' "$OUT" | tail -n 8)"
+  FINAL_CODE="$CODE" FINAL_MSG="Update failed (exit $CODE): $FAIL_TAIL"
+  # A dead interpreter with a failed/impossible heal means retrying can never
+  # succeed. Prefer that actionable diagnosis over the generic fork-update tail.
   if ! tcc_probe_python "$INSTALL_ROOT/venv/bin/python3" \
       && ! tcc_probe_python "$INSTALL_ROOT/venv/bin/python"; then
     FINAL_MSG="Update failed: the Python interpreter inside $INSTALL_ROOT/venv cannot start (heal state: $TCC_HEAL_STATE). Reinstall the runtime with the Hermes installer, or run hermes doctor --fix from a terminal if any hermes command still works."

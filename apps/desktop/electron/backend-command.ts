@@ -21,6 +21,15 @@ export function serveBackendArgs(profile?: string) {
   return [...head, 'serve', '--host', '127.0.0.1', '--port', '0']
 }
 
+export const SAFEHOUSE_SERVE_HOST = '127.0.0.1'
+export const SAFEHOUSE_SERVE_PORT = 8642
+
+export function safehouseServeBackendArgs(profile?: string) {
+  const head = profile ? ['--profile', profile] : []
+
+  return [...head, 'serve', '--host', SAFEHOUSE_SERVE_HOST, '--port', String(SAFEHOUSE_SERVE_PORT)]
+}
+
 /**
  * Rewrite a resolved backend argv from `serve` to the legacy
  * `dashboard --no-open` form, preserving every other argument (incl. a leading

@@ -24,7 +24,8 @@ import {
   isOfficialSshRemote,
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
-  OFFICIAL_REPO_HTTPS_URL
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveUpdateCompareRemote
 } from './update-remote'
 
 test('canonicalGitHubRemote normalizes SSH and HTTPS forms to the same value', () => {
@@ -76,4 +77,37 @@ test('isOfficialSshRemote does NOT match forks, other hosts, or HTTPS', () => {
 test('OFFICIAL_REPO_HTTPS_URL canonicalizes to OFFICIAL_REPO_CANONICAL', () => {
   // Invariant: the URL we substitute in must be the same repo we detect.
   assert.equal(canonicalGitHubRemote(OFFICIAL_REPO_HTTPS_URL), OFFICIAL_REPO_CANONICAL)
+})
+
+test('resolveUpdateCompareRemote prefers upstream on main when that remote exists', () => {
+  assert.deepEqual(
+    resolveUpdateCompareRemote({
+      branch: 'main',
+      originUrl: 'https://github.com/IsrafilEMIN/hermes-agent.git',
+      upstreamUrl: OFFICIAL_REPO_HTTPS_URL
+    }),
+    { remote: 'upstream', compareUrl: OFFICIAL_REPO_HTTPS_URL }
+  )
+})
+
+test('resolveUpdateCompareRemote stays on origin without an upstream remote', () => {
+  const originUrl = 'https://github.com/IsrafilEMIN/hermes-agent.git'
+
+  assert.deepEqual(resolveUpdateCompareRemote({ branch: 'main', originUrl, upstreamUrl: '' }), {
+    remote: 'origin',
+    compareUrl: originUrl
+  })
+})
+
+test('resolveUpdateCompareRemote does not use upstream for non-main branches', () => {
+  const originUrl = 'https://github.com/IsrafilEMIN/hermes-agent.git'
+
+  assert.deepEqual(
+    resolveUpdateCompareRemote({
+      branch: 'bb/gui',
+      originUrl,
+      upstreamUrl: OFFICIAL_REPO_HTTPS_URL
+    }),
+    { remote: 'origin', compareUrl: originUrl }
+  )
 })

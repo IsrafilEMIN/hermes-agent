@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *) self="$(dirname "$self")/$link" ;;
+  esac
+done
+ROOT="$(cd "$(dirname "$self")/.." && pwd)"
+export HERMES_SOURCE_ROOT="${HERMES_SOURCE_ROOT:-$ROOT}"
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+while true; do
+  "$ROOT/scripts/hermes" backend-start --foreground || true
+  sleep 1
+done

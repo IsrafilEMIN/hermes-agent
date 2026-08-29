@@ -577,7 +577,7 @@ test.skipIf(process.platform === 'win32')(
     const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes wrapper ownership '))
     const installDir = path.join(temp, 'install dir')
     const venvBin = path.join(installDir, 'venv', 'bin')
-    const pythonLink = path.join(venvBin, 'python')
+    const pythonLink = path.join(venvBin, 'python3')
     const entrypoint = path.join(installDir, 'hermes')
     const launcher = path.join(temp, 'hermes launcher')
     const python = (await exec('command -v python3')).stdout.trim()
@@ -618,7 +618,13 @@ test.skipIf(process.platform === 'win32')(
 
     const waitForEntrypoint = async (process: ReturnType<typeof spawn>) => {
       for (let attempt = 0; attempt < 40; attempt += 1) {
-        const command = (await exec(`ps -ww -o command= -p ${process.pid}`)).stdout
+        let command = ''
+
+        try {
+          command = (await exec(`ps -ww -o command= -p ${process.pid}`)).stdout
+        } catch {
+          command = ''
+        }
 
         if (command.includes(entrypoint)) {
           return true

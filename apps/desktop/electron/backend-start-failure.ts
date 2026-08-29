@@ -28,6 +28,12 @@ export interface BackendStartFailureContext {
    * cloud) primary backend rather than spawning a local child.
    */
   attemptedRemote: boolean
+  /**
+   * True when local mode attached to a separately managed Safehouse backend
+   * instead of spawning an owned child. Those failures must stay retryable so
+   * launch/update can recover without Desktop spawning `hermes serve`.
+   */
+  managedLocalAttach?: boolean
 }
 
 /**
@@ -37,6 +43,10 @@ export interface BackendStartFailureContext {
  * without an app restart).
  */
 export function shouldLatchBackendStartFailure(context: BackendStartFailureContext): boolean {
+  if (context.managedLocalAttach) {
+    return false
+  }
+
   return !context.attemptedRemote
 }
 
@@ -137,4 +147,8 @@ export function shouldLatchHostKeyChangedFailure(context: RemoteBootRetryContext
  */
 export function isRetryableRemoteBootFailure(context: RemoteBootRetryContext): boolean {
   return context.attemptedRemote && !context.isReauth && context.isHostKeyChanged !== true
+}
+
+export function isRetryableLocalAttachFailure(context: BackendStartFailureContext): boolean {
+  return context.managedLocalAttach === true && !context.attemptedRemote
 }

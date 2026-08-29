@@ -11,6 +11,7 @@ import { DEV_CREDITS_MODE } from '../config/env.js'
 import { FACES } from '../content/faces.js'
 import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
+import { formatQuotaChip } from '../domain/usage.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
@@ -603,6 +604,8 @@ export function StatusRule({
       ? `Δ ${(usage.dev_credits_spent_micros / 10000).toFixed(1)}¢`
       : ''
 
+  const quotaText = formatQuotaChip(usage.quota)
+  const showQuota = !!quotaText && fits(SEP + stringWidth(quotaText))
   const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
   const showDuration = segs.duration && ok('duration') && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
 
@@ -726,6 +729,12 @@ export function StatusRule({
             <Text color={t.color.muted}>{' │ '}</Text>
             <Text color={t.color.warn}>◉ focus</Text>
           </Box>
+        ) : null}
+        {showQuota ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {quotaText}
+          </Text>
         ) : null}
         {showBar ? (
           <Text color={t.color.muted} wrap="truncate-end">

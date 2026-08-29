@@ -224,6 +224,7 @@ class PooledCredential:
     agent_key: Optional[str] = None
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
+    singleton_alias: Optional[bool] = None
     extra: Dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -314,6 +315,47 @@ def label_from_token(token: str, fallback: str) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return fallback
+
+
+def _codex_token_account_identity(access_token: str) -> Optional[Tuple[str, ...]]:
+    claims = _decode_jwt_claims(access_token)
+    if not claims:
+        return None
+    account_id = None
+    email = None
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict):
+        raw_account_id = auth_claims.get("chatgpt_account_id")
+        if isinstance(raw_account_id, str) and raw_account_id.strip():
+            account_id = raw_account_id.strip()
+    profile_claims = claims.get("https://api.openai.com/profile")
+    if isinstance(profile_claims, dict):
+        raw_email = profile_claims.get("email")
+        if isinstance(raw_email, str) and raw_email.strip():
+            email = raw_email.strip().casefold()
+    if email is None:
+        raw_email = claims.get("email")
+        if isinstance(raw_email, str) and raw_email.strip():
+            email = raw_email.strip().casefold()
+    if account_id is not None and email is not None:
+        return ("account_id+email", account_id, email)
+    if account_id is not None:
+        return ("account_id", account_id)
+    if email is not None:
+        return ("email", email)
+    return None
+
+
+def _codex_manual_entry_may_adopt(entry_access: str, store_access: str) -> bool:
+    if store_access == entry_access:
+        return True
+    entry_identity = _codex_token_account_identity(entry_access)
+    store_identity = _codex_token_account_identity(store_access)
+    if entry_identity is None or store_identity is None:
+        return False
+    if entry_identity[0] != "account_id+email" or store_identity[0] != "account_id+email":
+        return False
+    return entry_identity == store_identity
 
 
 def _next_priority(entries: List[PooledCredential]) -> int:
@@ -1298,6 +1340,32 @@ class CredentialPool:
             # the important signal is the refresh_token difference.
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
+            if entry.source == "manual:device_code":
+                if store_access:
+                    if not _codex_manual_entry_may_adopt(entry_access, store_access):
+                        return entry
+                    if entry.singleton_alias is not True:
+                        marked = replace(entry, singleton_alias=True)
+                        self._replace_entry(entry, marked)
+                        self._persist()
+                        entry = marked
+                elif entry.singleton_alias is not True:
+                    sibling = next(
+                        (
+                            item
+                            for item in self._entries
+                            if item.source == "device_code"
+                            and item.access_token == entry_access
+                            and (item.refresh_token or "") == entry_refresh
+                        ),
+                        None,
+                    )
+                    if sibling is None:
+                        return entry
+                    marked = replace(entry, singleton_alias=True)
+                    self._replace_entry(entry, marked)
+                    self._persist()
+                    entry = marked
             should_adopt = False
             if store_access and (
                 store_access != entry_access
@@ -1541,7 +1609,9 @@ class CredentialPool:
         # added pool entries (source="manual:*") are independent credentials
         # and must not write back to the singleton.  All singleton-seeded
         # device-code sources (nous, openai-codex, xAI) use ``device_code``.
-        if entry.source != "device_code":
+        if entry.source != "device_code" and (
+            self.provider != "openai-codex" or entry.singleton_alias is not True
+        ):
             return
         try:
             with _auth_store_lock():
@@ -2158,6 +2228,19 @@ class CredentialPool:
                 # remove all singleton-seeded (device_code) entries from the
                 # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                    if entry.source == "manual:device_code":
+                        reason = getattr(exc, "code", None) or "invalid_grant"
+                        if reason not in _TERMINAL_AUTH_REASONS:
+                            reason = "invalid_grant"
+                        self._mark_exhausted(
+                            entry,
+                            401,
+                            error_context={
+                                "reason": reason,
+                                "message": str(exc),
+                            },
+                        )
+                        return None
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
@@ -3451,6 +3534,52 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "label": custom_label or label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )
+        elif isinstance(tokens, dict) and tokens.get("refresh_token"):
+            # Refresh-only provider state: another process rotated the pair
+            # and consumed the access_token.  Retain the existing device_code
+            # rows through pruning, and migrate legacy manual aliases whose
+            # exact pair matches a device_code sibling BEFORE the stale-source
+            # prune could remove the sibling that proves the alias.  Hydrate
+            # both rows with the current store refresh_token so the shared
+            # single-use chain converges through one refresh POST.
+            store_refresh = str(tokens.get("refresh_token") or "").strip()
+            if not store_refresh:
+                return changed, active_sources
+            active_sources.add("device_code")
+            device_rows = [
+                item
+                for item in entries
+                if item.source == "device_code"
+                and str(item.access_token or "").strip()
+            ]
+            for idx, item in enumerate(entries):
+                if item.source != "manual:device_code" or item.singleton_alias:
+                    continue
+                access = str(item.access_token or "").strip()
+                if not access:
+                    continue
+                manual_refresh = str(item.refresh_token or "").strip()
+                sibling = next(
+                    (
+                        dev
+                        for dev in device_rows
+                        if dev.access_token == access
+                        and (not manual_refresh or (dev.refresh_token or "") == manual_refresh)
+                    ),
+                    None,
+                )
+                if sibling is None:
+                    continue
+                entries[idx] = replace(
+                    item,
+                    singleton_alias=True,
+                    refresh_token=store_refresh,
+                )
+                for dev_idx, dev in enumerate(entries):
+                    if dev.id == sibling.id:
+                        entries[dev_idx] = replace(dev, refresh_token=store_refresh)
+                        break
+                changed = True
 
     elif provider == "xai-oauth":
         # When the user logs in via ``hermes model`` -> xAI Grok OAuth,

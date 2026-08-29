@@ -215,17 +215,17 @@ test('full (non-shallow) clones run the rev-list count', () => {
   assert.equal(shouldCountCommits({ isShallow: false }), true)
 })
 
-test('shallow commit logs select only the fetched remote tip', () => {
-  assert.deepEqual(resolveCommitLogSelection({ branch: 'main', isShallow: true }), {
+test('shallow commit logs select only the fetched tip', () => {
+  assert.deepEqual(resolveCommitLogSelection({ isShallow: true }), {
     limit: 1,
-    revision: 'origin/main'
+    revision: 'FETCH_HEAD'
   })
 })
 
 test('full-clone commit logs keep the complete behind range', () => {
-  assert.deepEqual(resolveCommitLogSelection({ branch: 'release', isShallow: false }), {
+  assert.deepEqual(resolveCommitLogSelection({ isShallow: false }), {
     limit: 40,
-    revision: 'HEAD..origin/release'
+    revision: 'HEAD..FETCH_HEAD'
   })
 })
 

@@ -1539,6 +1539,10 @@ try {
         Write-HandoffLog "retry policy is unavailable after checkout swap; using legacy retry rules"
         $shouldRetry = $res.Code -ne 0 -and $res.Code -ne 2
     }
+    # Fork updater exits 8 with a deliberately paused rebase and exits 9 when
+    # runtime refresh fails. Retrying either state cannot repair it and can
+    # obscure the recovery instructions, so both remain terminal.
+    if ($res.Code -eq 8 -or $res.Code -eq 9) { $shouldRetry = $false }
     if ($shouldRetry) {
         # One retry for update-boundary failures. Most exit-2 safety refusals
         # remain terminal, but self-lock deferral also uses exit 2 and writes

@@ -5,6 +5,7 @@ import { test } from 'vitest'
 import { isReauthRequiredError, makeUnsignedOauthError } from './backend-health'
 import {
   isHostKeyChangedBootFailure,
+  isRetryableLocalAttachFailure,
   isRetryableRemoteBootFailure,
   shouldLatchBackendStartFailure,
   shouldLatchHostKeyChangedFailure,
@@ -86,6 +87,16 @@ test('unsigned OAuth latches and is never auto-retried; needsOauthLogin alone st
 test('local failures are never auto-retried by the remote self-heal loop', () => {
   assert.equal(isRetryableRemoteBootFailure({ attemptedRemote: false, isReauth: false }), false)
   assert.equal(isRetryableRemoteBootFailure({ attemptedRemote: false, isReauth: true }), false)
+})
+
+test('does not latch a managed local attach failure so launch-and-retry works', () => {
+  assert.equal(shouldLatchBackendStartFailure({ attemptedRemote: false, managedLocalAttach: true }), false)
+})
+
+test('managed local attach failures are retryable without spawning', () => {
+  assert.equal(isRetryableLocalAttachFailure({ attemptedRemote: false, managedLocalAttach: true }), true)
+  assert.equal(isRetryableLocalAttachFailure({ attemptedRemote: true, managedLocalAttach: true }), false)
+  assert.equal(isRetryableLocalAttachFailure({ attemptedRemote: false }), false)
 })
 
 test('retryable and reauth-latch are mutually exclusive for remote failures', () => {

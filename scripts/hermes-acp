@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *) self="$(dirname "$self")/$link" ;;
+  esac
+done
+ROOT="$(cd "$(dirname "$self")/.." && pwd)"
+export HERMES_SOURCE_ROOT="${HERMES_SOURCE_ROOT:-$ROOT}"
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+unset PYTHONPATH
+unset PYTHONHOME
+PY=""
+if [[ -x "$ROOT/venv/bin/python" ]]; then
+  PY="$ROOT/venv/bin/python"
+elif [[ -x "$ROOT/venv/bin/python3" ]]; then
+  PY="$ROOT/venv/bin/python3"
+elif [[ -x "${HERMES_HOME}/hermes-agent/venv/bin/python" ]]; then
+  PY="${HERMES_HOME}/hermes-agent/venv/bin/python"
+elif [[ -x "${HERMES_HOME}/hermes-agent/venv/bin/python3" ]]; then
+  PY="${HERMES_HOME}/hermes-agent/venv/bin/python3"
+fi
+if [[ -z "$PY" ]]; then
+  printf '%s\n' "hermes-acp: python not found in $ROOT/venv" >&2
+  exit 1
+fi
+exec "$PY" "$ROOT/hermes" acp "$@"

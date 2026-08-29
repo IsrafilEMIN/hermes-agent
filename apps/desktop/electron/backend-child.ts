@@ -41,6 +41,7 @@ export interface StopBackendTreesForUpdateDeps {
 }
 
 export interface BackendProcessRoot {
+  ownsProcess?: boolean
   pid?: number | null
 }
 
@@ -56,7 +57,7 @@ export interface KillableChild extends BackendProcessRoot {
  * best-effort semantics in main.ts.
  */
 export function stopBackendChild(child: KillableChild | null | undefined, deps: StopBackendChildDeps) {
-  if (!child || child.killed) {
+  if (!child || child.killed || child.ownsProcess === false) {
     return
   }
 
@@ -95,7 +96,7 @@ export function stopBackendTreesForUpdate(
   primary: BackendProcessRoot | null | undefined,
   deps: StopBackendTreesForUpdateDeps
 ): void {
-  if (primary && Number.isInteger(primary.pid)) {
+  if (primary && primary.ownsProcess !== false && Number.isInteger(primary.pid)) {
     deps.forceKillProcessTree(primary.pid as number)
   }
 

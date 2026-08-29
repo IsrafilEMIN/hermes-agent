@@ -4537,6 +4537,8 @@ def _sync_codex_pool_entries(
             refresh_this_entry = bool(
                 prev_at and entry.get("access_token") == prev_at
             )
+            if refresh_this_entry:
+                entry["singleton_alias"] = True
         else:
             # ``manual:api_key`` and any future non-device-code sources.
             refresh_this_entry = False

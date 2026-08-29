@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import httpx
 
@@ -28,6 +30,7 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -525,7 +528,10 @@ def _fetch_codex_account_usage(
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key, label, window_id in (
+        ("primary_window", "Session", "5h"),
+        ("secondary_window", "Weekly", "7d"),
+    ):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
@@ -535,6 +541,7 @@ def _fetch_codex_account_usage(
                 label=label,
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
+                id=window_id,
             )
         )
     details: list[str] = []
@@ -772,12 +779,12 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
     payload = response.json() or {}
     windows: list[AccountUsageWindow] = []
     mapping = (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
+        ("five_hour", "Current session", "5h"),
+        ("seven_day", "Current week", "7d"),
+        ("seven_day_opus", "Opus week", None),
+        ("seven_day_sonnet", "Sonnet week", None),
     )
-    for key, label in mapping:
+    for key, label, window_id in mapping:
         window = payload.get(key) or {}
         util = window.get("utilization")
         if util is None:
@@ -788,6 +795,7 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
                 label=label,
                 used_percent=used,
                 reset_at=_parse_dt(window.get("resets_at")),
+                id=window_id,
             )
         )
     details: list[str] = []
@@ -897,6 +905,234 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        if normalized == "opencode-go":
+            from agent.usage_opencode_go import fetch_opencode_go_account_usage
+
+            return fetch_opencode_go_account_usage(base_url=base_url, api_key=api_key)
+        if normalized == "xai-oauth":
+            from agent.usage_xai_oauth import fetch_xai_oauth_account_usage
+
+            return fetch_xai_oauth_account_usage(base_url=base_url, api_key=api_key)
+        if normalized == "cursor":
+            from agent.usage_cursor import fetch_cursor_account_usage
+
+            return fetch_cursor_account_usage(base_url=base_url, api_key=api_key)
     except Exception:
         return None
     return None
+
+
+_STATUS_QUOTA_TTL_S = 30.0
+_STATUS_QUOTA_FIELDS = ("five_hour", "seven_day", "monthly", "monthly_other")
+_FIELD_BY_WINDOW_ID = {
+    "5h": "five_hour",
+    "7d": "seven_day",
+    "monthly": "monthly",
+    "monthly_other": "monthly_other",
+}
+_FIELD_BY_WINDOW_LABEL = {
+    "session": "five_hour",
+    "weekly": "seven_day",
+    "current session": "five_hour",
+    "current week": "seven_day",
+    "5h": "five_hour",
+    "7d": "seven_day",
+    "monthly": "monthly",
+}
+_status_quota_lock = threading.Lock()
+_status_quota_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_status_quota_inflight: set[str] = set()
+
+
+def reset_status_quota_cache() -> None:
+    with _status_quota_lock:
+        _status_quota_cache.clear()
+        _status_quota_inflight.clear()
+
+
+def _quota_cache_key(provider: str, credential_id: Optional[str] = None) -> str:
+    return f"{str(provider or '').strip().lower()}\0{credential_id or ''}"
+
+
+def _window_field(window: AccountUsageWindow) -> Optional[str]:
+    wid = getattr(window, "id", None)
+    if isinstance(wid, str) and wid in _FIELD_BY_WINDOW_ID:
+        return _FIELD_BY_WINDOW_ID[wid]
+    label = str(window.label or "").strip().lower()
+    return _FIELD_BY_WINDOW_LABEL.get(label)
+
+
+def snapshot_to_quota_account(
+    snapshot: Optional[AccountUsageSnapshot],
+    *,
+    active: bool,
+) -> Optional[dict[str, Any]]:
+    if snapshot is None or snapshot.unavailable_reason:
+        return None
+    account: dict[str, Any] = {"provider": snapshot.provider, "active": bool(active)}
+    for window in snapshot.windows:
+        field = _window_field(window)
+        if not field or window.used_percent is None:
+            continue
+        if field in ("monthly", "monthly_other") and snapshot.provider not in {"cursor", "opencode-go"}:
+            continue
+        used = float(window.used_percent)
+        if not math.isfinite(used):
+            continue
+        account[field] = used
+    if not any(field in account for field in _STATUS_QUOTA_FIELDS):
+        return None
+    return account
+
+
+def collect_status_quota(
+    provider: Optional[str],
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    normalized = str(provider or "").strip().lower()
+    if normalized in {"", "auto", "custom"}:
+        return []
+    pool_entries = []
+    if normalized in {"openai-codex", "openrouter", "opencode-go", "xai-oauth"}:
+        try:
+            from agent.credential_pool import load_pool
+
+            pool = load_pool(normalized)
+            pool_entries = list(pool.entries() or [])
+        except Exception:
+            pool = None
+    if not pool_entries:
+        try:
+            snap = fetch_account_usage(normalized, base_url=base_url, api_key=api_key)
+        except Exception:
+            return []
+        account = snapshot_to_quota_account(snap, active=True)
+        return [account] if account else []
+    active_id = None
+    try:
+        current = pool.current() if pool is not None else None
+        if current is not None:
+            active_id = current.id
+        elif api_key and pool is not None:
+            active_id = pool.entry_id_for_api_key(api_key)
+    except Exception:
+        active_id = None
+    groups: list[list[Any]] = []
+    group_by_key: dict[Any, list[Any]] = {}
+    for entry in pool_entries:
+        key = getattr(entry, "runtime_api_key", None)
+        if not key:
+            continue
+        dedupe_key = key
+        if normalized == "openai-codex":
+            try:
+                from agent.credential_pool import _codex_token_account_identity
+
+                identity = _codex_token_account_identity(key)
+            except Exception:
+                identity = None
+            if identity is not None:
+                dedupe_key = identity
+        group = group_by_key.get(dedupe_key)
+        if group is None:
+            group = []
+            group_by_key[dedupe_key] = group
+            groups.append(group)
+        group.append(entry)
+    for group in groups:
+        for index, entry in enumerate(group):
+            if getattr(entry, "id", None) == active_id and index:
+                group.insert(0, group.pop(index))
+                break
+    accounts: list[dict[str, Any]] = []
+    any_active = False
+    for group in groups[:4]:
+        group_active = any(getattr(entry, "id", None) == active_id for entry in group)
+        for entry in group:
+            try:
+                snap = fetch_account_usage(
+                    normalized,
+                    api_key=entry.runtime_api_key,
+                    base_url=entry.runtime_base_url or base_url,
+                )
+            except Exception:
+                snap = None
+            account = snapshot_to_quota_account(snap, active=group_active)
+            if account is None:
+                continue
+            accounts.append(account)
+            any_active = any_active or group_active
+            break
+    if accounts and not any_active:
+        accounts[0] = {**accounts[0], "active": True}
+    return accounts
+
+
+def get_cached_status_quota(
+    provider: Optional[str],
+    *,
+    credential_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    key = _quota_cache_key(str(provider or ""), credential_id)
+    with _status_quota_lock:
+        hit = _status_quota_cache.get(key)
+    if not hit:
+        return []
+    return [dict(account) for account in hit[1]]
+
+
+def refresh_status_quota(
+    provider: Optional[str],
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    credential_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    accounts = collect_status_quota(provider, api_key=api_key, base_url=base_url)
+    key = _quota_cache_key(str(provider or ""), credential_id)
+    with _status_quota_lock:
+        _status_quota_cache[key] = (time.monotonic(), [dict(account) for account in accounts])
+    return [dict(account) for account in accounts]
+
+
+def schedule_status_quota_refresh(
+    provider: Optional[str],
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    credential_id: Optional[str] = None,
+    on_done: Optional[Callable[[list[dict[str, Any]]], None]] = None,
+) -> bool:
+    normalized = str(provider or "").strip().lower()
+    if normalized in {"", "auto", "custom"}:
+        return False
+    key = _quota_cache_key(normalized, credential_id)
+    now = time.monotonic()
+    with _status_quota_lock:
+        if key in _status_quota_inflight:
+            return False
+        hit = _status_quota_cache.get(key)
+        if hit is not None and (now - hit[0]) < _STATUS_QUOTA_TTL_S:
+            return False
+        _status_quota_inflight.add(key)
+
+    def _run() -> None:
+        try:
+            accounts = refresh_status_quota(
+                normalized,
+                api_key=api_key,
+                base_url=base_url,
+                credential_id=credential_id,
+            )
+            if on_done is not None:
+                on_done(accounts)
+        except Exception:
+            logger.debug("status quota refresh failed", exc_info=True)
+        finally:
+            with _status_quota_lock:
+                _status_quota_inflight.discard(key)
+
+    threading.Thread(target=_run, daemon=True, name="hermes-quota-refresh").start()
+    return True

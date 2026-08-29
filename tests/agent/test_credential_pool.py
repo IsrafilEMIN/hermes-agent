@@ -1707,7 +1707,913 @@ class TestLeastUsedStrategy:
 
 
 
-# ── OpenAI Codex OAuth cross-process sync tests ────────────────────────────
+def _codex_identity_jwt(account_id: str, email: str, *, exp: int) -> str:
+    return _jwt_with_claims({
+        "exp": exp,
+        "email": email,
+        "https://api.openai.com/profile": {"email": email},
+        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+    })
+
+
+def test_codex_manual_alias_same_account_adopts_rotated_singleton_pair(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    old_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now - 60))
+    new_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-alias",
+                        "label": "alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    alias = next(e for e in pool.entries() if e.source == "manual:device_code")
+    assert alias.access_token == old_at
+
+    auth_path = tmp_path / "hermes" / "auth.json"
+    payload = json.loads(auth_path.read_text())
+    payload["providers"]["openai-codex"]["tokens"] = {
+        "access_token": new_at,
+        "refresh_token": "singleton-rt-new",
+    }
+    auth_path.write_text(json.dumps(payload, indent=2))
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    selected = pool.select()
+
+    alias = next(e for e in pool.entries() if e.source == "manual:device_code")
+    singleton = next(e for e in pool.entries() if e.source == "device_code")
+    assert refresh_calls == [], (
+        f"same-account alias must adopt the rotated singleton pair without POSTing; got {refresh_calls}"
+    )
+    assert alias.access_token == new_at
+    assert alias.refresh_token == "singleton-rt-new"
+    assert alias.singleton_alias is True
+    assert singleton.access_token == new_at
+    assert singleton.refresh_token == "singleton-rt-new"
+    assert selected is not None and selected.source == "manual:device_code"
+    assert alias.priority < singleton.priority
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted_alias = next(
+        e for e in persisted["credential_pool"]["openai-codex"]
+        if e["source"] == "manual:device_code"
+    )
+    assert persisted_alias["refresh_token"] == "singleton-rt-new"
+    assert persisted_alias["singleton_alias"] is True
+
+
+def test_codex_manual_entry_distinct_account_refreshes_own_pair(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    manual_at = _codex_identity_jwt("acct-2", "acct2@example.com", exp=int(now - 60))
+    singleton_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_at,
+                        "refresh_token": "singleton-rt",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-manual",
+                        "label": "other-account",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": manual_at,
+                        "refresh_token": "manual-rt",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    selected = pool.select()
+
+    manual = next(e for e in pool.entries() if e.source == "manual:device_code")
+    singleton = next(e for e in pool.entries() if e.source == "device_code")
+    assert refresh_calls == [(manual_at, "manual-rt")], (
+        f"distinct manual account must refresh its own pair; got {refresh_calls}"
+    )
+    assert manual.access_token == "fresh-at:manual-rt"
+    assert manual.refresh_token == "fresh-rt:manual-rt"
+    assert manual.singleton_alias is None
+    assert singleton.access_token == singleton_at
+    assert singleton.refresh_token == "singleton-rt"
+    assert manual.access_token != singleton.access_token
+    assert manual.refresh_token != singleton.refresh_token
+    assert selected is not None and selected.id == singleton.id
+    assert manual.priority < singleton.priority
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted_manual = next(
+        e for e in persisted["credential_pool"]["openai-codex"]
+        if e["source"] == "manual:device_code"
+    )
+    assert persisted_manual["access_token"] == "fresh-at:manual-rt"
+    assert persisted_manual["refresh_token"] == "fresh-rt:manual-rt"
+    assert "singleton_alias" not in persisted_manual
+    assert persisted["providers"]["openai-codex"]["tokens"] == {
+        "access_token": singleton_at,
+        "refresh_token": "singleton-rt",
+    }
+
+
+def test_codex_manual_entry_email_only_identity_does_not_adopt_singleton(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    old_at = _jwt_with_claims({
+        "exp": int(now - 60),
+        "https://api.openai.com/profile": {"email": "Fleet.User@Example.COM"},
+    })
+    new_at = _jwt_with_claims({
+        "exp": int(now + 7200),
+        "https://api.openai.com/profile": {"email": "fleet.user@example.com"},
+    })
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-alias",
+                        "label": "alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    auth_path = tmp_path / "hermes" / "auth.json"
+    payload = json.loads(auth_path.read_text())
+    payload["providers"]["openai-codex"]["tokens"] = {
+        "access_token": new_at,
+        "refresh_token": "singleton-rt-new",
+    }
+    auth_path.write_text(json.dumps(payload, indent=2))
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    pool.select()
+
+    alias = next(e for e in pool.entries() if e.source == "manual:device_code")
+    singleton = next(e for e in pool.entries() if e.source == "device_code")
+    assert refresh_calls == [(old_at, "singleton-rt-old")], (
+        f"email-only identity must not adopt the singleton pair; got {refresh_calls}"
+    )
+    assert alias.access_token == "fresh-at:singleton-rt-old"
+    assert alias.refresh_token == "fresh-rt:singleton-rt-old"
+    assert alias.singleton_alias is None
+    assert singleton.access_token == new_at
+    assert singleton.refresh_token == "singleton-rt-new"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert persisted["providers"]["openai-codex"]["tokens"] == {
+        "access_token": new_at,
+        "refresh_token": "singleton-rt-new",
+    }
+
+
+def test_codex_manual_entry_same_email_different_workspace_keeps_own_pair(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    manual_at = _codex_identity_jwt("acct-1", "user@example.com", exp=int(now - 60))
+    singleton_at = _codex_identity_jwt("acct-2", "user@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_at,
+                        "refresh_token": "singleton-rt",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-manual",
+                        "label": "other-workspace",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": manual_at,
+                        "refresh_token": "manual-rt",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    pool.select()
+
+    manual = next(e for e in pool.entries() if e.source == "manual:device_code")
+    assert refresh_calls == [(manual_at, "manual-rt")], (
+        f"same email in a different workspace must keep its own pair; got {refresh_calls}"
+    )
+    assert manual.access_token == "fresh-at:manual-rt"
+    assert manual.refresh_token == "fresh-rt:manual-rt"
+    assert manual.singleton_alias is None
+
+
+def test_codex_manual_entry_same_workspace_different_email_keeps_own_pair(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    manual_at = _codex_identity_jwt("acct-1", "alice@example.com", exp=int(now - 60))
+    singleton_at = _codex_identity_jwt("acct-1", "bob@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_at,
+                        "refresh_token": "singleton-rt",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-manual",
+                        "label": "other-member",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": manual_at,
+                        "refresh_token": "manual-rt",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    pool.select()
+
+    manual = next(e for e in pool.entries() if e.source == "manual:device_code")
+    assert refresh_calls == [(manual_at, "manual-rt")], (
+        f"different workspace member must keep its own pair; got {refresh_calls}"
+    )
+    assert manual.access_token == "fresh-at:manual-rt"
+    assert manual.refresh_token == "fresh-rt:manual-rt"
+    assert manual.singleton_alias is None
+
+
+def test_codex_manual_alias_and_sibling_converge_with_single_refresh_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    old_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now - 60))
+    new_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-alias",
+                        "label": "alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                    {
+                        "id": "cred-device",
+                        "label": "device",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    auth_path = tmp_path / "hermes" / "auth.json"
+    payload = json.loads(auth_path.read_text())
+    payload["providers"]["openai-codex"]["tokens"] = {
+        "access_token": new_at,
+        "refresh_token": "singleton-rt-new",
+    }
+    auth_path.write_text(json.dumps(payload, indent=2))
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    selected = pool.select()
+
+    alias = next(e for e in pool.entries() if e.source == "manual:device_code")
+    device = next(e for e in pool.entries() if e.source == "device_code")
+    assert refresh_calls == [], (
+        f"same-account alias and sibling must both adopt without POSTing; got {refresh_calls}"
+    )
+    assert alias.access_token == new_at
+    assert alias.refresh_token == "singleton-rt-new"
+    assert device.access_token == new_at
+    assert device.refresh_token == "singleton-rt-new"
+    assert selected is not None and selected.source == "manual:device_code"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted_alias = next(
+        e for e in persisted["credential_pool"]["openai-codex"]
+        if e["source"] == "manual:device_code"
+    )
+    assert persisted_alias["singleton_alias"] is True
+
+
+def test_codex_marked_manual_alias_refresh_only_store_adopts(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    old_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now - 60))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "refresh_token": "singleton-rt-new",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-alias",
+                        "label": "alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                        "singleton_alias": True,
+                    },
+                    {
+                        "id": "cred-device",
+                        "label": "device",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    pool.select()
+
+    alias = next(e for e in pool.entries() if e.source == "manual:device_code")
+    device = next(e for e in pool.entries() if e.source == "device_code")
+    assert refresh_calls == [(old_at, "singleton-rt-new")], (
+        f"marked alias must adopt the refresh-only store chain and POST once; got {refresh_calls}"
+    )
+    assert alias.access_token == "fresh-at:singleton-rt-new"
+    assert alias.refresh_token == "fresh-rt:singleton-rt-new"
+    assert device.access_token == "fresh-at:singleton-rt-new"
+    assert device.refresh_token == "fresh-rt:singleton-rt-new"
+
+
+def test_codex_unmarked_manual_alias_backfills_marker_from_sibling_and_single_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    old_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now - 60))
+    other_at = _codex_identity_jwt("acct-9", "other@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "refresh_token": "singleton-rt-new",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-alias",
+                        "label": "alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                    {
+                        "id": "cred-device",
+                        "label": "device",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                    {
+                        "id": "cred-other",
+                        "label": "other",
+                        "auth_type": "oauth",
+                        "priority": 2,
+                        "source": "manual:device_code",
+                        "access_token": other_at,
+                        "refresh_token": "other-rt",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    alias = next(e for e in pool.entries() if e.id == "cred-alias")
+    device = next(e for e in pool.entries() if e.id == "cred-device")
+    other = next(e for e in pool.entries() if e.id == "cred-other")
+    assert alias.singleton_alias is True
+    assert alias.refresh_token == "singleton-rt-new"
+    assert device.refresh_token == "singleton-rt-new"
+    assert other.singleton_alias is None
+    assert other.refresh_token == "other-rt"
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    pool.select()
+
+    alias = next(e for e in pool.entries() if e.id == "cred-alias")
+    device = next(e for e in pool.entries() if e.id == "cred-device")
+    other = next(e for e in pool.entries() if e.id == "cred-other")
+    assert refresh_calls == [(old_at, "singleton-rt-new")], (
+        f"migrated alias must refresh the adopted store chain exactly once; got {refresh_calls}"
+    )
+    assert alias.access_token == "fresh-at:singleton-rt-new"
+    assert alias.refresh_token == "fresh-rt:singleton-rt-new"
+    assert device.access_token == "fresh-at:singleton-rt-new"
+    assert device.refresh_token == "fresh-rt:singleton-rt-new"
+    assert other.access_token == other_at
+    assert other.refresh_token == "other-rt"
+    assert other.singleton_alias is None
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted_alias = next(
+        e for e in persisted["credential_pool"]["openai-codex"]
+        if e["id"] == "cred-alias"
+    )
+    assert persisted_alias["singleton_alias"] is True
+
+
+def test_codex_manual_alias_without_refresh_hydrated_from_refresh_only_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    old_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now - 60))
+    other_at = _codex_identity_jwt("acct-9", "other@example.com", exp=int(now - 60))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "refresh_token": "singleton-rt-new",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-alias",
+                        "label": "alias",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": old_at,
+                    },
+                    {
+                        "id": "cred-device",
+                        "label": "device",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": old_at,
+                        "refresh_token": "singleton-rt-old",
+                    },
+                    {
+                        "id": "cred-conflict",
+                        "label": "conflict",
+                        "auth_type": "oauth",
+                        "priority": 2,
+                        "source": "manual:device_code",
+                        "access_token": old_at,
+                        "refresh_token": "conflict-rt",
+                    },
+                    {
+                        "id": "cred-other",
+                        "label": "other",
+                        "auth_type": "oauth",
+                        "priority": 3,
+                        "source": "manual:device_code",
+                        "access_token": other_at,
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    alias = next(e for e in pool.entries() if e.id == "cred-alias")
+    conflict = next(e for e in pool.entries() if e.id == "cred-conflict")
+    other = next(e for e in pool.entries() if e.id == "cred-other")
+    assert alias.singleton_alias is True
+    assert alias.refresh_token == "singleton-rt-new"
+    assert conflict.singleton_alias is None
+    assert conflict.refresh_token == "conflict-rt"
+    assert other.singleton_alias is None
+    assert other.refresh_token is None
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    pool.select()
+
+    alias = next(e for e in pool.entries() if e.id == "cred-alias")
+    conflict = next(e for e in pool.entries() if e.id == "cred-conflict")
+    assert refresh_calls == [
+        (old_at, "singleton-rt-new"),
+        (old_at, "conflict-rt"),
+    ], f"alias uses the store chain, conflict refreshes its own; got {refresh_calls}"
+    assert alias.access_token == "fresh-at:singleton-rt-new"
+    assert alias.refresh_token == "fresh-rt:singleton-rt-new"
+    assert conflict.access_token == "fresh-at:conflict-rt"
+    assert conflict.refresh_token == "fresh-rt:conflict-rt"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted_alias = next(
+        e for e in persisted["credential_pool"]["openai-codex"]
+        if e["id"] == "cred-alias"
+    )
+    assert persisted_alias["singleton_alias"] is True
+    persisted_conflict = next(
+        e for e in persisted["credential_pool"]["openai-codex"]
+        if e["id"] == "cred-conflict"
+    )
+    assert "singleton_alias" not in persisted_conflict
+
+
+def test_codex_manual_entry_terminal_failure_quarantines_only_manual_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    manual_at = _codex_identity_jwt("acct-2", "acct2@example.com", exp=int(now - 60))
+    singleton_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_at,
+                        "refresh_token": "singleton-rt",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-manual",
+                        "label": "other-account",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": manual_at,
+                        "refresh_token": "manual-rt",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool, STATUS_DEAD
+    from hermes_cli.auth import AuthError
+
+    pool = load_pool("openai-codex")
+
+    def _terminal_refresh_failure(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="openai-codex",
+            code="codex_refresh_failed",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _terminal_refresh_failure)
+
+    pool.select()
+
+    manual = next(e for e in pool.entries() if e.source == "manual:device_code")
+    assert manual.last_status == STATUS_DEAD
+    assert manual.last_error_reason == "invalid_grant"
+    singleton = next(e for e in pool.entries() if e.source == "device_code")
+    assert singleton.last_status is None
+    assert singleton.access_token == singleton_at
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert persisted["providers"]["openai-codex"]["tokens"] == {
+        "access_token": singleton_at,
+        "refresh_token": "singleton-rt",
+    }
+    assert pool.select() is not None
+
+
+def test_codex_manual_entry_opaque_tokens_never_adopt_singleton(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    now = time.time()
+    manual_at = _jwt_with_claims({"exp": int(now - 60)})
+    singleton_at = _codex_identity_jwt("acct-1", "acct1@example.com", exp=int(now + 7200))
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "active_provider": "openai-codex",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_at,
+                        "refresh_token": "singleton-rt",
+                    },
+                },
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-manual",
+                        "label": "opaque",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": manual_at,
+                        "refresh_token": "manual-rt",
+                    },
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    refresh_calls = []
+
+    def _fake_codex_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": f"fresh-at:{refresh_token}",
+            "refresh_token": f"fresh-rt:{refresh_token}",
+            "last_refresh": "2026-08-29T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_codex_refresh)
+
+    pool.select()
+
+    manual = next(e for e in pool.entries() if e.source == "manual:device_code")
+    assert refresh_calls == [(manual_at, "manual-rt")], (
+        f"opaque manual tokens must refresh their own pair; got {refresh_calls}"
+    )
+    assert manual.access_token == "fresh-at:manual-rt"
+    assert manual.refresh_token == "fresh-rt:manual-rt"
+    assert manual.singleton_alias is None
 
 
 

@@ -306,39 +306,21 @@ test('setLimit rejects a non-positive or fractional cap', () => {
   assert.equal(coordinator.limit, 2)
 })
 
-// ── main.ts wiring ──────────────────────────────────────────────────────────
-// The coordinator is only as good as the timeout main.ts hands it. A queued
-// ticket that outlives the renderer's backend-boot budget holds the pool key
-// hostage: the renderer has already reported "backend didn't come up", and
-// every later click on that profile joins the stale wait instead of failing
-// fast with a reason.
+// ── fork main.ts wiring ─────────────────────────────────────────────────────
+// This fork never spawns local backend children from Electron. All local
+// profile routes attach to one separately managed, Safehouse-wrapped backend,
+// so they must not consume child-process slots from this coordinator.
 {
   const here = path.dirname(fileURLToPath(import.meta.url))
   const mainSource = fs.readFileSync(path.join(here, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
-
-  const withTimeoutSource = fs
-    .readFileSync(path.join(here, '..', 'src', 'lib', 'with-timeout.ts'), 'utf8')
-    .replace(/\r\n/g, '\n')
-
-  test('main.ts bounds the slot wait below the renderer backend-boot budget', () => {
-    const slotWait = Number(/const POOL_SLOT_WAIT_MS = ([\d_]+)/.exec(mainSource)?.[1]?.replace(/_/g, ''))
-
-    const bootBudget = Number(
-      /export const BACKEND_BOOT_WAIT_TIMEOUT_MS = ([\d_]+)/.exec(withTimeoutSource)?.[1]?.replace(/_/g, '')
-    )
-
-    assert.ok(Number.isFinite(slotWait) && slotWait > 0, 'POOL_SLOT_WAIT_MS must be a literal in main.ts')
-    assert.ok(Number.isFinite(bootBudget), 'BACKEND_BOOT_WAIT_TIMEOUT_MS must be a literal')
-    assert.ok(slotWait < bootBudget, `slot wait ${slotWait}ms must be below the boot budget ${bootBudget}ms`)
-    assert.match(mainSource, /localBackendSpawnCoordinator\.request\(poolKey, \{ timeoutMs: POOL_SLOT_WAIT_MS \}\)/)
-    assert.doesNotMatch(mainSource, /request\(poolKey, \{ timeoutMs: POOL_IDLE_MS \}\)/)
+  test('main.ts attaches pooled local profiles without taking child-process slots', () => {
+    assert.match(mainSource, /const attached = await connectSafehouseLocalBackend\(/)
+    assert.doesNotMatch(mainSource, /localBackendSpawnCoordinator\.request\(/)
+    assert.doesNotMatch(mainSource, /const POOL_SLOT_WAIT_MS =/)
   })
 
-  test('main.ts pushes the live pool max into the coordinator when the preference changes', () => {
-    // Pool sizing is a live device preference (#92581); the hard cap must
-    // follow it, otherwise raising the max in Settings would leave spawns
-    // queued behind the launch-time value.
-    assert.match(mainSource, /new LocalBackendSpawnCoordinator\(poolLimits\.maxBackends\)/)
-    assert.match(mainSource, /localBackendSpawnCoordinator\.setLimit\(poolLimits\.maxBackends\)/)
+  test('main.ts keeps the managed backend outside Electron process ownership', () => {
+    assert.match(mainSource, /entry\.process = attached\.handle/)
+    assert.match(mainSource, /Desktop will not spawn hermes serve/)
   })
 }

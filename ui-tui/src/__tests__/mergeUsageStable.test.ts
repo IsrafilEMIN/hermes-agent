@@ -54,4 +54,34 @@ describe('mergeUsageStable (#41480 status-bar flicker)', () => {
   it('reports no change for deep-equal usages', () => {
     expect(usageChanged(baseUsage, { ...baseUsage })).toBe(false)
   })
+
+  it('compares quota by value, not reference', () => {
+    const quota = [{ provider: 'opencode-go', active: true, five_hour: 25, seven_day: 60, monthly: 35 }]
+    const withQuota = mergeUsageStable(baseUsage, { quota })
+
+    expect(withQuota).not.toBe(baseUsage)
+    expect(withQuota.quota).toEqual(quota)
+    expect(usageChanged(withQuota, { ...withQuota })).toBe(false)
+    expect(usageChanged(withQuota, { ...withQuota, quota: [{ ...quota[0] }] })).toBe(false)
+    expect(usageChanged(withQuota, { ...withQuota, quota: [{ ...quota[0], five_hour: 26 }] })).toBe(true)
+    expect(usageChanged(withQuota, { ...withQuota, quota: undefined })).toBe(true)
+  })
+
+  it('keeps the previous quota when a patch omits it', () => {
+    const quota = [{ provider: 'opencode-go', active: true, five_hour: 25 }]
+    const withQuota = mergeUsageStable(baseUsage, { quota })
+    const merged = mergeUsageStable(withQuota, { input: 1, total: 1 })
+
+    expect(merged).not.toBe(withQuota)
+    expect(merged.quota).toEqual(quota)
+    expect(merged.input).toBe(1)
+  })
+
+  it('clears quota when a patch sends an empty array', () => {
+    const quota = [{ provider: 'openai-codex', active: true, five_hour: 25 }]
+    const withQuota = mergeUsageStable(baseUsage, { quota })
+    const cleared = mergeUsageStable(withQuota, { quota: [] })
+
+    expect(cleared.quota).toEqual([])
+  })
 })

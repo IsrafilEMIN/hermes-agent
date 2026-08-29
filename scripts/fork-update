@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *) self="$(dirname "$self")/$link" ;;
+  esac
+done
+ROOT="$(cd "$(dirname "$self")/.." && pwd)"
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+PY=""
+if [[ -x "$ROOT/venv/bin/python" ]]; then
+  PY="$ROOT/venv/bin/python"
+elif [[ -x "$ROOT/venv/bin/python3" ]]; then
+  PY="$ROOT/venv/bin/python3"
+fi
+if [[ -z "$PY" ]]; then
+  printf '%s\n' "hermes update: python not found in $ROOT/venv" >&2
+  exit 1
+fi
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$ROOT"
+exec "$PY" -m hermes_cli.fork_update "$@"
