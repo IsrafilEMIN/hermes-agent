@@ -20,9 +20,7 @@ describe('formatQuotaChip', () => {
   })
 
   it('maps cursor to CURSOR with monthly and monthly_other windows', () => {
-    expect(formatQuotaChip([{ provider: 'cursor', active: true, monthly: 6, monthly_other: 5 }])).toBe(
-      'CURSOR ● 94/95'
-    )
+    expect(formatQuotaChip([{ provider: 'cursor', active: true, monthly: 6, monthly_other: 5 }])).toBe('CURSOR ● 94/95')
   })
 
   it('maps openai-codex to GPT with 5h/7d windows', () => {
@@ -51,8 +49,6 @@ describe('formatQuotaChip', () => {
   })
 
   it('clamps remaining to 0-100', () => {
-    expect(formatQuotaChip([{ provider: 'openai', active: true, five_hour: 110, seven_day: -5 }])).toBe(
-      'GPT ● 0/100'
-    )
+    expect(formatQuotaChip([{ provider: 'openai', active: true, five_hour: 110, seven_day: -5 }])).toBe('GPT ● 0/100')
   })
 })

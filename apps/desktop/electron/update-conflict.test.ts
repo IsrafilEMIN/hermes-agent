@@ -100,6 +100,7 @@ test('paused conflicted rebase stays an available update even when HEAD equals t
     git('checkout', '-q', 'main')
 
     commitFile(cwd, git, 'feature.txt', 'local fork commit\n', 'local fork work')
+
     try {
       git('rebase', 'refs/remotes/upstream/main')
     } catch {}
@@ -110,9 +111,11 @@ test('paused conflicted rebase stays an available update even when HEAD equals t
     assert.equal(git('rev-list', 'HEAD..refs/remotes/upstream/main', '--count'), '0')
 
     const currentSha = git('rev-parse', 'HEAD')
+
     const unmergedPaths = parseUnmergedFileList(
       execFileSync('git', ['ls-files', '--unmerged'], { cwd, encoding: 'utf8', timeout: 10_000 })
     )
+
     assert.deepEqual(unmergedPaths, ['feature.txt'])
 
     const result = resolveUpdateConflictResult({
@@ -166,6 +169,7 @@ test('unmerged index without a paused rebase reports an unresolved-conflict reco
     )
 
     const currentSha = git('rev-parse', 'HEAD')
+
     const unmergedPaths = parseUnmergedFileList(
       execFileSync('git', ['ls-files', '--unmerged'], { cwd, encoding: 'utf8', timeout: 10_000 })
     )

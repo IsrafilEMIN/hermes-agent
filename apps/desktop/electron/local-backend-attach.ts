@@ -8,10 +8,10 @@ import {
   parseSafehouseBackendRecord,
   resolveLifecycleCommands,
   resolveReadyRecordPath,
-  SafehouseBackendUnavailableError,
-  safehouseBaseUrl,
   type SafehouseAttachHandle,
   type SafehouseBackendRecord,
+  SafehouseBackendUnavailableError,
+  safehouseBaseUrl,
   safehouseWsUrl,
   validateSafehouseBackendRecord
 } from './local-backend-lifecycle'
@@ -100,6 +100,7 @@ export async function connectSafehouseLocalBackend(
   const env = deps.env || process.env
   const expected = expectedSafehouseEndpoint(env)
   const commands = resolveLifecycleCommands(env)
+
   const fail = (reason: string): never => {
     throw new SafehouseBackendUnavailableError({
       host: expected.host,

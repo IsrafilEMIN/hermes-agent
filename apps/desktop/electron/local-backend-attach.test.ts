@@ -97,6 +97,7 @@ test('connectSafehouseLocalBackend rejects owner metadata that is not the safeho
 test('watchSafehouseBackendReady reconnects when generation metadata changes', () => {
   let current = { ...record }
   const restarts: number[] = []
+
   let handler: () => void = () => {}
 
   const watch = watchSafehouseBackendReady({
@@ -129,6 +130,7 @@ test('watchSafehouseBackendReady reconnects when generation metadata changes', (
 test('watchSafehouseBackendReady reports unavailable after the ready record vanishes', () => {
   const errors: string[] = []
   let missing = false
+
   let handler: () => void = () => {}
 
   watchSafehouseBackendReady({

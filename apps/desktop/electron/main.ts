@@ -1391,10 +1391,12 @@ function registerMediaProtocol() {
 let mainWindow = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn> | SafehouseAttachHandle, any>()
 const remoteLiveness = new RemoteLivenessTracker()
+
 let stopSafehouseWatch = () => {}
 
 function armSafehouseWatch(record: SafehouseBackendRecord) {
   stopSafehouseWatch()
+
   const session = watchSafehouseBackendReady({
     current: record,
     hermesHome: HERMES_HOME,
@@ -1430,6 +1432,7 @@ function armSafehouseWatch(record: SafehouseBackendRecord) {
 
   stopSafehouseWatch = () => {
     session.stop()
+
     stopSafehouseWatch = () => {}
   }
 }
@@ -3011,14 +3014,17 @@ function writeZoomState(zoomLevel) {
 function resolveUpdateRoot() {
   const harnessRoot = path.join(os.homedir(), 'Developer', 'harness', 'hermes-agent')
   const envSource = process.env.HERMES_SOURCE_ROOT ? path.resolve(process.env.HERMES_SOURCE_ROOT) : null
+
   const isRuntimeOrGlobal = (root) => {
     const normalized = String(root || '').replace(/\\/g, '/')
+
     return (
       normalized.includes('/.hermes/') ||
       normalized.endsWith('/.hermes') ||
       normalized.includes('/.local/')
     )
   }
+
   const usableSource = (root) =>
     Boolean(root) &&
     directoryExists(path.join(root, '.git')) &&
@@ -3132,6 +3138,7 @@ async function checkUpdates() {
 
   const rebaseInProgress =
     directoryExists(path.join(gitDir, 'rebase-merge')) || directoryExists(path.join(gitDir, 'rebase-apply'))
+
   const unmergedPaths = parseUnmergedFileList((await runGit(['ls-files', '--unmerged'], { cwd: updateRoot })).stdout)
 
   if (rebaseInProgress || unmergedPaths.length > 0) {
@@ -3218,22 +3225,27 @@ async function checkUpdates() {
   // Forks that track origin/<branch> can still trail official main. Match CLI
   // `hermes update --check`: prefer `upstream` on main when that remote exists.
   const upstreamLookup = await runGit(['remote', 'get-url', 'upstream'], { cwd: updateRoot })
+
   const planned = resolveUpdateCompareRemote({
     branch,
     originUrl,
     upstreamUrl: upstreamLookup.code === 0 ? upstreamLookup.stdout.trim() : ''
   })
+
   // Installer checkouts are shallow: preserve the boundary with --depth 1,
   // mirroring CLI `--check` so the behind count stays honest.
   const isShallow =
     (await runGit(['rev-parse', '--is-shallow-repository'], { cwd: updateRoot })).stdout.trim() === 'true'
+
   const depthArgs = isShallow ? ['--depth', '1'] : []
+
   // Passive checks must never fetch the official repo over SSH (FIDO2
   // hardware-touch prompts). Anonymous HTTPS never prompts.
   const fetchTarget =
     planned.remote === 'upstream' && isOfficialSshRemote(planned.compareUrl)
       ? OFFICIAL_REPO_HTTPS_URL
       : planned.compareUrl
+
   let compareUrl = planned.compareUrl
   let fetched = await runGit(['fetch', '--quiet', ...depthArgs, fetchTarget, branch], { cwd: updateRoot })
 
@@ -12814,6 +12826,7 @@ async function startHermes() {
     }
   })().catch(async error => {
     stopSafehouseWatch()
+
     if (!backendConnectionState.clearPromiseForAttempt(connectionAttempt)) {
       throw error
     }

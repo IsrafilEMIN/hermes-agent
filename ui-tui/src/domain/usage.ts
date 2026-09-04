@@ -11,10 +11,21 @@ const remainingQuota = (used: number | undefined): string => {
 }
 
 const usageProviderLabel = (provider: string): string => {
-  if (provider === 'openai-codex' || provider === 'openai') return 'GPT'
-  if (provider === 'opencode-go') return 'GO'
-  if (provider === 'cursor') return 'CURSOR'
-  if (provider === 'xai' || provider === 'xai-oauth') return 'GROK'
+  if (provider === 'openai-codex' || provider === 'openai') {
+    return 'GPT'
+  }
+
+  if (provider === 'opencode-go') {
+    return 'GO'
+  }
+
+  if (provider === 'cursor') {
+    return 'CURSOR'
+  }
+
+  if (provider === 'xai' || provider === 'xai-oauth') {
+    return 'GROK'
+  }
 
   return provider
 }
@@ -32,9 +43,12 @@ const quotaWindows = (account: UsageQuotaAccount): (number | undefined)[] => {
 }
 
 export const formatQuotaChip = (accounts: UsageQuotaAccount[] | null | undefined): string => {
-  if (!accounts || accounts.length === 0) return ''
+  if (!accounts || accounts.length === 0) {
+    return ''
+  }
 
   const label = usageProviderLabel(accounts[0].provider)
+
   const parts = accounts.map(
     account => `${account.active ? '●' : '○'} ${quotaWindows(account).map(remainingQuota).join('/')}`
   )
