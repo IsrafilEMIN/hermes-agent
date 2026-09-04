@@ -168,6 +168,23 @@ def _write_diagnostic(runtime_home: Path, name: str, body: str) -> Path:
     return path
 
 
+def _paused_rebase(git_cmd: list[str], cwd: Path) -> bool:
+    for state_dir in ("rebase-merge", "rebase-apply"):
+        git_path = _git_out(git_cmd, cwd, ["rev-parse", "--git-path", state_dir])
+        if not git_path:
+            continue
+        candidate = Path(git_path)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        if candidate.is_dir():
+            return True
+    return False
+
+
+def _unmerged_index(git_cmd: list[str], cwd: Path) -> bool:
+    return bool(_git_out(git_cmd, cwd, ["ls-files", "--unmerged"]))
+
+
 def run_fork_aware_update(
     *,
     source_root: Optional[Path] = None,
@@ -197,6 +214,84 @@ def run_fork_aware_update(
     result.branch = current_branch if current_branch != "HEAD" else branch
     dirty = _git_out(git_cmd, cwd, ["status", "--porcelain"])
 
+    paused_rebase = _paused_rebase(git_cmd, cwd)
+    if paused_rebase or _unmerged_index(git_cmd, cwd):
+        conflicted = [
+            line
+            for line in _git_out(git_cmd, cwd, ["diff", "--name-only", "--diff-filter=U"]).splitlines()
+            if line.strip()
+        ]
+        post_head = _git_out(git_cmd, cwd, ["rev-parse", "HEAD"])
+        status_text = _git_out(git_cmd, cwd, ["status"])
+        body = "\n".join(
+            [
+                f"source={cwd}",
+                f"branch={result.branch}",
+                f"head={pre_head}",
+                "conflicted_files:",
+                *([f"  {name}" for name in conflicted] or ["  (none listed)"]),
+                "git_status:",
+                status_text or "",
+            ]
+        )
+        diagnostic = _write_diagnostic(runtime_home, "conflict", body)
+        prior = _read_json(runtime_home / RECOVERY_NAME)
+        recovery = {
+            "status": "committed-rebase-conflict" if paused_rebase else "stash-pop-conflict",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "source_root": str(cwd),
+            "runtime_home": str(runtime_home),
+            "branch": result.branch,
+            "head": pre_head,
+            "origin_url": _git_out(git_cmd, cwd, ["remote", "get-url", "origin"]),
+            "upstream_url": _git_out(git_cmd, cwd, ["remote", "get-url", "upstream"]),
+            "origin_head": _git_out(git_cmd, cwd, ["rev-parse", f"origin/{result.branch}"]),
+            "upstream_head": _git_out(git_cmd, cwd, ["rev-parse", f"upstream/{result.branch}"]),
+            "stash_ref": _git_out(git_cmd, cwd, ["rev-parse", "-q", "--verify", "refs/stash"]),
+            "dirty": dirty,
+            "post_head": post_head,
+            "diagnostic_path": str(diagnostic),
+            "conflicted_files": conflicted,
+        }
+        for key in ("origin_url", "upstream_url", "origin_head", "upstream_head", "stash_ref"):
+            if not recovery[key] and prior.get(key):
+                recovery[key] = prior[key]
+        recovery_path = _record_recovery(runtime_home, recovery)
+        result.status = "conflict"
+        result.exit_code = CONFLICT_EXIT
+        result.post_head = post_head
+        result.recovery_path = str(recovery_path)
+        result.diagnostic_path = str(diagnostic)
+        result.conflicted_files = conflicted
+        if paused_rebase:
+            result.report = (
+                "an earlier update left a rebase paused in this checkout; refusing to classify it as up to date.\n"
+                "Resolve and continue:\n"
+                f"  cd {cwd}\n"
+                "  git status\n"
+                "  git add <resolved-files>\n"
+                "  git rebase --continue\n"
+                "  hermes update\n"
+                "Abort and restore the original HEAD and dirty worktree:\n"
+                "  git rebase --abort\n"
+                f"recovery={recovery_path}\n"
+                f"diagnostic={diagnostic}"
+            )
+        else:
+            if recovery.get("stash_ref"):
+                resolution = (
+                    "The stash is preserved; resolve the conflict markers in the tree, then:\n"
+                    "  git stash drop\n"
+                )
+            else:
+                resolution = "Resolve the conflict markers in the tree, then rerun:\n  hermes update\n"
+            result.report = (
+                "an earlier update left conflicted changes in the index; refusing to classify this checkout as up to date.\n"
+                + resolution
+                + f"recovery={recovery_path}\n"
+                f"diagnostic={diagnostic}"
+            )
+        return result
 
     origin_url = _git_out(git_cmd, cwd, ["remote", "get-url", "origin"])
     ok_upstream, upstream_url = _ensure_upstream_remote(git_cmd, cwd)
@@ -820,6 +915,8 @@ def install_backend_launchd(source_root: Optional[Path] = None, home: Optional[P
     plist_dir = home / "Library" / "LaunchAgents"
     plist_dir.mkdir(parents=True, exist_ok=True)
     plist_path = plist_dir / f"{DEFAULT_LAUNCHD_LABEL}.plist"
+    composer_images_dir = home / "Library" / "Application Support" / "Hermes" / "composer-images"
+    composer_images_dir.mkdir(parents=True, exist_ok=True)
     safehouse = _safehouse_command()
     watch = source / "scripts" / "hermes-backend-watch"
     args = [
@@ -827,6 +924,7 @@ def install_backend_launchd(source_root: Optional[Path] = None, home: Optional[P
         "--workdir=",
         f"--add-dirs={home / 'Developer'}",
         f"--add-dirs={home / '.hermes'}",
+        f"--add-dirs-ro={composer_images_dir}",
         f"--add-dirs-ro={home / '.local' / 'bin'}",
     ]
     profile = home / ".config" / "agent-safehouse" / "deny-sensitive-v2.sb"

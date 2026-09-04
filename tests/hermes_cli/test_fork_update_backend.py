@@ -1,10 +1,13 @@
 import json
 import os
 import plistlib
+import shutil
 import socket
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from hermes_cli import fork_update
 
@@ -76,6 +79,13 @@ def test_install_backend_launchd_writes_plist(tmp_path, monkeypatch):
     assert payload["RunAtLoad"] is True
     args = payload["ProgramArguments"]
     assert any(str(a).endswith("safehouse") for a in args)
+    assert (
+        f"--add-dirs-ro={tmp_path / 'home' / 'Library' / 'Application Support' / 'Hermes' / 'composer-images'}"
+        in args
+    )
+    assert (
+        tmp_path / "home" / "Library" / "Application Support" / "Hermes" / "composer-images"
+    ).is_dir()
     assert any(str(a).endswith("hermes-backend-watch") for a in args)
     assert payload["WorkingDirectory"] == str(source)
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
@@ -402,3 +412,165 @@ def test_fork_aware_update_conflict_abort_restores_head_and_wip(tmp_path, monkey
     assert _git_repo(checkout, "rev-parse", "HEAD") == pre_head
     assert (checkout / "wip.txt").read_text(encoding="utf-8") == "wip change\n"
     assert _git_repo(checkout, "stash", "list") == ""
+
+
+def test_fork_aware_update_stays_conflicted_while_rebase_paused(tmp_path, monkeypatch):
+    import hermes_cli.fork_update as fu
+
+    checkout = _build_fork_fixture(tmp_path)
+    monkeypatch.setenv("HERMES_SOURCE_ROOT", str(checkout))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(fu, "OFFICIAL_REPO_URL", str(tmp_path / "repo" / "upstream.git"))
+    pre_head = _git_repo(checkout, "rev-parse", "HEAD")
+    _advance_upstream(tmp_path, conflicting=True)
+    first = fu.run_fork_aware_update(assume_yes=True)
+    assert first.exit_code == fu.CONFLICT_EXIT
+    assert first.status == "conflict"
+    paused_head = _git_repo(checkout, "rev-parse", "HEAD")
+    assert paused_head != pre_head
+    assert (checkout / ".git" / "rebase-merge").is_dir()
+    assert _git_repo(checkout, "rev-parse", "upstream/main") == paused_head
+    assert _git_repo(checkout, "rev-list", "--count", "HEAD..upstream/main") == "0"
+
+    follow_up = fu.run_fork_aware_update(assume_yes=True)
+    assert follow_up.exit_code == fu.CONFLICT_EXIT
+    assert follow_up.status == "conflict"
+    assert "rebase paused" in follow_up.report
+    assert "git rebase --continue" in follow_up.report
+    assert follow_up.conflicted_files == ["README.md"]
+    assert follow_up.recovery_path and Path(follow_up.recovery_path).exists()
+    recovery = json.loads(Path(follow_up.recovery_path).read_text(encoding="utf-8"))
+    assert recovery["status"] == "committed-rebase-conflict"
+    assert recovery["conflicted_files"] == ["README.md"]
+    assert _git_repo(checkout, "rev-parse", "HEAD") == paused_head
+    assert (checkout / ".git" / "rebase-merge").is_dir()
+
+    checked = fu.run_fork_aware_update(check_only=True)
+    assert checked.exit_code == fu.CONFLICT_EXIT
+    assert checked.status == "conflict"
+    assert (checkout / ".git" / "rebase-merge").is_dir()
+
+
+def test_fork_aware_update_stays_conflicted_with_unmerged_index(tmp_path, monkeypatch):
+    import hermes_cli.fork_update as fu
+
+    checkout = _build_fork_fixture(tmp_path)
+    monkeypatch.setenv("HERMES_SOURCE_ROOT", str(checkout))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(fu, "OFFICIAL_REPO_URL", str(tmp_path / "repo" / "upstream.git"))
+    _git_repo(checkout, "reset", "--hard", "upstream/main")
+    _write(checkout, "README.md", "local delta\n")
+    _advance_upstream(tmp_path, conflicting=True)
+    first = fu.run_fork_aware_update(assume_yes=True)
+    assert first.exit_code == fu.CONFLICT_EXIT
+    assert first.status == "conflict"
+    assert _git_repo(checkout, "stash", "list") != ""
+    assert _git_repo(checkout, "rev-parse", "upstream/main") == _git_repo(checkout, "rev-parse", "HEAD")
+
+    follow_up = fu.run_fork_aware_update(assume_yes=True)
+    assert follow_up.exit_code == fu.CONFLICT_EXIT
+    assert follow_up.status == "conflict"
+    assert "conflicted changes in the index" in follow_up.report
+    assert "git stash drop" in follow_up.report
+    assert follow_up.conflicted_files == ["README.md"]
+    assert follow_up.recovery_path and Path(follow_up.recovery_path).exists()
+    recovery = json.loads(Path(follow_up.recovery_path).read_text(encoding="utf-8"))
+    assert recovery["status"] == "stash-pop-conflict"
+    assert recovery["stash_ref"]
+    assert _git_repo(checkout, "stash", "list") != ""
+
+    checked = fu.run_fork_aware_update(check_only=True)
+    assert checked.exit_code == fu.CONFLICT_EXIT
+    assert checked.status == "conflict"
+
+
+def test_fork_aware_update_clean_fork_followup_stays_up_to_date(tmp_path, monkeypatch):
+    import hermes_cli.fork_update as fu
+
+    checkout = _build_fork_fixture(tmp_path)
+    monkeypatch.setenv("HERMES_SOURCE_ROOT", str(checkout))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(fu, "OFFICIAL_REPO_URL", str(tmp_path / "repo" / "upstream.git"))
+    venv_bin = checkout / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (venv_bin / "python").chmod(0o755)
+    uv_bin = tmp_path / "home" / "bin"
+    uv_bin.mkdir(parents=True)
+    (uv_bin / "uv").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (uv_bin / "uv").chmod(0o755)
+    result = fu.run_fork_aware_update(assume_yes=True)
+    assert result.exit_code == 0
+    assert result.status == "up_to_date"
+    _advance_upstream(tmp_path, conflicting=False)
+    result = fu.run_fork_aware_update(assume_yes=True)
+    assert result.exit_code == 0
+    assert result.status == "updated"
+    result = fu.run_fork_aware_update(assume_yes=True)
+    assert result.exit_code == 0
+    assert result.status == "up_to_date"
+    checked = fu.run_fork_aware_update(check_only=True)
+    assert checked.exit_code == 0
+    assert checked.status == "up_to_date"
+    assert not (checkout / ".git" / "rebase-merge").exists()
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or not (_REPO_ROOT / "venv" / "bin" / "python").exists(),
+    reason="needs bash and a repo venv",
+)
+def test_fork_update_script_execs_real_module(tmp_path):
+    env = dict(os.environ, HERMES_HOME=str(tmp_path))
+    script = _REPO_ROOT / "scripts" / "fork-update"
+    result = subprocess.run(
+        ["bash", str(script), "--help"],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--restart-backend" in result.stdout
+    assert "invalid choice" not in result.stderr
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or not (_REPO_ROOT / "venv" / "bin" / "python").exists(),
+    reason="needs bash and a repo venv",
+)
+def test_restart_managed_backend_script_assembles_valid_argv(tmp_path):
+    env = dict(os.environ, HERMES_HOME=str(tmp_path))
+    script = _REPO_ROOT / "scripts" / "restart-managed-backend"
+    result = subprocess.run(
+        ["bash", str(script), "--help"],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--restart-backend" in result.stdout
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or not (_REPO_ROOT / "venv" / "bin" / "python").exists(),
+    reason="needs bash and a repo venv",
+)
+def test_scripts_hermes_forwards_fork_update_through_real_launcher(tmp_path):
+    env = dict(os.environ, HERMES_HOME=str(tmp_path), HERMES_WORKDIR="")
+    script = _REPO_ROOT / "scripts" / "hermes"
+    result = subprocess.run(
+        ["bash", str(script), "fork-update", "--help"],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--restart-backend" in result.stdout
+    assert "invalid choice" not in result.stderr

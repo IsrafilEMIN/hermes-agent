@@ -373,6 +373,7 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
+import { parseUnmergedFileList, resolveUpdateConflictResult } from './update-conflict'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -3127,6 +3128,29 @@ async function checkUpdates() {
       hermesRoot: updateRoot,
       branch
     }
+  }
+
+  const rebaseInProgress =
+    directoryExists(path.join(gitDir, 'rebase-merge')) || directoryExists(path.join(gitDir, 'rebase-apply'))
+  const unmergedPaths = parseUnmergedFileList((await runGit(['ls-files', '--unmerged'], { cwd: updateRoot })).stdout)
+
+  if (rebaseInProgress || unmergedPaths.length > 0) {
+    const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+
+    const [currentSha, currentBranch] = await Promise.all([
+      git(['rev-parse', 'HEAD']),
+      git(['rev-parse', '--abbrev-ref', 'HEAD'])
+    ])
+
+    return resolveUpdateConflictResult({
+      branch,
+      currentBranch,
+      currentSha,
+      fetchedAt: Date.now(),
+      hermesRoot: updateRoot,
+      rebaseInProgress,
+      unmergedPaths
+    })
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
